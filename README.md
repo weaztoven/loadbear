@@ -3,7 +3,6 @@
 A small, friendly load balancer written in Go.
 
 [![CI](https://github.com/weaztoven/loadbear/actions/workflows/ci.yml/badge.svg)](https://github.com/weaztoven/loadbear/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/weaztoven/loadbear)](https://goreportcard.com/report/github.com/weaztoven/loadbear)
 [![License](https://img.shields.io/github/license/weaztoven/loadbear)](LICENSE)
 [![Go Reference](https://pkg.go.dev/badge/github.com/weaztoven/loadbear.svg)](https://pkg.go.dev/github.com/weaztoven/loadbear)
 
