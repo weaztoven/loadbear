@@ -1,0 +1,32 @@
+services:
+  fakebackend-1:
+    build:
+      context: .
+      target: fakebackend
+    command: ["--port", "8081", "--name", "backend-1"]
+
+  fakebackend-2:
+    build:
+      context: .
+      target: fakebackend
+    command: ["--port", "8082", "--name", "backend-2"]
+
+  fakebackend-3:
+    build:
+      context: .
+      target: fakebackend
+    command: ["--port", "8083", "--name", "backend-3"]
+
+  loadbear:
+    build:
+      context: .
+      target: loadbear
+    volumes:
+      - ./examples/config.docker.yaml:/etc/loadbear/config.yaml:ro
+    depends_on:
+      - fakebackend-1
+      - fakebackend-2
+      - fakebackend-3
+    ports:
+      - "8080:8080"
+      - "127.0.0.1:9090:9090"
