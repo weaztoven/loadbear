@@ -73,7 +73,7 @@ func (m *Metrics) Snapshot() []BackendStatus {
 			ActiveConnections: b.ActiveConnections.Load(),
 			TotalRequests:     b.TotalRequests.Load(),
 			TotalFailures:     b.TotalFailures.Load(),
-			CircuitState:      string(b.CircuitState),
+			CircuitState:      string(b.GetCircuitState()),
 		})
 	}
 	return status

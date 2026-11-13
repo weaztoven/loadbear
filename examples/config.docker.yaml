@@ -37,7 +37,7 @@ rate_limit:
   rate: 100
   burst: 200
   window: "1m"
-  trusted_proxy: false
+  trusted_proxies: []
 
 shutdown:
   grace_period: "15s"

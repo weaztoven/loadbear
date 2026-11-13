@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -14,7 +15,7 @@ import (
 
 const (
 	DefaultListen      = ":8080"
-	DefaultAdminListen = ":9090"
+	DefaultAdminListen = "127.0.0.1:9090"
 	DefaultLogLevel    = "info"
 	DefaultLogFormat   = "json"
 	DefaultStrategy    = "round_robin"
@@ -71,11 +72,11 @@ type ProxyConfig struct {
 }
 
 type RateLimitConfig struct {
-	Enabled      bool         `yaml:"enabled"`
-	Rate         float64      `yaml:"rate"`
-	Burst        int          `yaml:"burst"`
-	Window       YAMLDuration `yaml:"window"`
-	TrustedProxy bool         `yaml:"trusted_proxy"`
+	Enabled        bool         `yaml:"enabled"`
+	Rate           float64      `yaml:"rate"`
+	Burst          int          `yaml:"burst"`
+	Window         YAMLDuration `yaml:"window"`
+	TrustedProxies []string     `yaml:"trusted_proxies"`
 }
 
 type ShutdownConfig struct {
@@ -250,6 +251,15 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimit.Window.Duration() <= 0 {
 		return errors.New("rate_limit.window must be positive")
+	}
+	for i, proxy := range c.RateLimit.TrustedProxies {
+		proxy = strings.TrimSpace(proxy)
+		if net.ParseIP(proxy) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(proxy); err != nil {
+			return fmt.Errorf("rate_limit.trusted_proxies[%d] must be an IP address or CIDR", i)
+		}
 	}
 	if c.Shutdown.GracePeriod.Duration() <= 0 {
 		return errors.New("shutdown.grace_period must be positive")

@@ -15,7 +15,7 @@ loadbear is a small, dependency-light HTTP reverse proxy that distributes reques
 - Reverse proxy to configured HTTP(S) backends.
 - Round robin, smooth weighted round robin, least connections, and IP hash selection.
 - Periodic active health checks and passive health changes after proxy errors.
-- Retries for GET, HEAD, and OPTIONS requests on upstream errors.
+- Retries for GET, HEAD, and OPTIONS requests on upstream errors when the body is absent or replayable, only before response headers are committed, and within the original request context.
 - Configurable, request-context-aware delay between retry attempts.
 - Per-backend circuit-breaker state.
 - Per-client-IP token-bucket rate limiting with periodic eviction of idle client buckets.
@@ -99,7 +99,7 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `listen` | string | `:8080` | Proxy HTTP listen address. Overridden by `LOADBEAR_LISTEN`. |
-| `admin_listen` | string | `:9090` | Admin HTTP listen address. |
+| `admin_listen` | string | `127.0.0.1:9090` | Admin HTTP listen address. Docker config overrides this to `:9090` inside its container. |
 | `log_level` | string | `info` | Log verbosity: `debug`, `info`, `warn`, or `error`. Overridden by `LOADBEAR_LOG_LEVEL`. |
 | `log_format` | string | `json` | `json` selects JSON logging; other values use text logging. |
 | `strategy` | string | `round_robin` | Backend selection: `round_robin`, `smooth_weighted_round_robin`, `least_connections`, or `ip_hash`. |
@@ -117,16 +117,16 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 | `proxy.response_header_timeout` | duration | `10s` | Upstream response-header timeout. |
 | `proxy.tls_handshake_timeout` | duration | `10s` | Upstream TLS handshake timeout. |
 | `proxy.dial_timeout` | duration | `5s` | Upstream connection dial timeout. |
-| `proxy.request_timeout` | duration | `30s` | HTTP server read and write timeout setting. |
-| `proxy.retry_max_attempts` | integer | `2` | Maximum total attempts for eligible requests, including the first selection. |
+| `proxy.request_timeout` | duration | `30s` | HTTP server read and write timeout setting; a client request context/deadline also bounds all upstream attempts and backoff. |
+| `proxy.retry_max_attempts` | integer | `2` | Maximum total attempts for eligible requests, including the first selection. Retried requests must have no body or a `GetBody` replay function. |
 | `proxy.retry_backoff` | duration | `100ms` | Delay between retry attempts; waiting stops when the request context is cancelled. |
 | `proxy.circuit_failure_threshold` | integer | `5` | Consecutive failures before opening a backend circuit. |
-| `proxy.circuit_cooldown` | duration | `30s` | Time an open circuit waits before allowing a half-open probe. |
+| `proxy.circuit_cooldown` | duration | `30s` | Time an open circuit waits before allowing one half-open probe. |
 | `rate_limit.enabled` | boolean | `true` | Enable per-client-IP request limiting. |
 | `rate_limit.rate` | number | `100` | Token refill rate per second. |
 | `rate_limit.burst` | integer | `200` | Maximum token bucket size. |
 | `rate_limit.window` | duration | `1m` | Used for Retry-After, stale bucket age, and the interval for periodic stale-bucket eviction (half this duration). |
-| `rate_limit.trusted_proxy` | boolean | `false` | Trust the first address in `X-Forwarded-For` for client IP derivation. |
+| `rate_limit.trusted_proxies` | list of IPs/CIDRs | `[]` | Trust `X-Forwarded-For` only when the direct peer IP is in this list. Empty means never trust the header. |
 | `shutdown.grace_period` | duration | `15s` | Grace period used during HTTP server shutdown. |
 
 See [examples/config.example.yaml](examples/config.example.yaml) and [examples/config.docker.yaml](examples/config.docker.yaml).
@@ -145,6 +145,8 @@ Unhealthy or circuit-open backends are excluded by selection.
 ## Admin endpoints
 
 The admin listener defaults to port `9090`; these paths are not registered on the proxy listener.
+
+The `/status` endpoint exposes backend URLs and topology. Keep the admin listener private and do not expose `/status` publicly; the default bind is loopback. Docker's example binds inside the container, while Compose publishes the host admin port only on `127.0.0.1`.
 
 `GET /status` returns backend state. Example shape:
 
@@ -204,6 +206,8 @@ PowerShell (use `curl.exe` to invoke curl rather than the PowerShell alias):
 
 Each fake backend responds with JSON identifying its name and request path. To observe failover, stop one fake backend (press Ctrl+C in its terminal, or stop its process using your shell's normal process controls), then continue sending requests. Proxy errors mark a backend down and eligible requests can be retried on another backend. Once all backend health states are down, the proxy returns `503 Service Unavailable` with a plain-text body. Active health checks may take multiple intervals to restore a backend.
 
+Fake backend fault modes can be selected globally with `--mode hang|close|drop-mid|slow`, or per request with `?mode=hang`, `?mode=close`, `?mode=drop-mid`, or `?mode=slow`. `close` drops the connection before response headers; `drop-mid` closes after a partial response.
+
 ## Testing
 
 Run the tests and race detector:
@@ -227,6 +231,12 @@ Or use `make cover` for a coverage profile and function summary. CI also runs fo
 - SIGHUP hot reload is not implemented.
 - Metrics are a small hand-written Prometheus text endpoint, not a complete Prometheus client implementation.
 - Load/performance benchmarks and WebSocket integration tests are not currently provided.
+
+## Security notes
+
+- The admin endpoint reports backend topology. Bind it to loopback or a private network and do not publish it to the public internet.
+- Forwarded client IP headers are ignored by default. Configure `rate_limit.trusted_proxies` with only the exact proxy IPs or CIDRs you control.
+- The legacy `rate_limit.trusted_proxy` boolean is no longer supported; migrate to `trusted_proxies` (see [CHANGELOG.md](CHANGELOG.md)).
 
 ## Contributing
 

@@ -2,6 +2,7 @@ package backend
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -110,6 +111,33 @@ func TestCircuitBreakerTransitions(t *testing.T) {
 	b.RecordSuccess()
 	if b.CircuitState != CircuitClosed {
 		t.Fatalf("successful expired-open recovery state = %q", b.CircuitState)
+	}
+}
+
+func TestHalfOpenAllowsOnlyOneConcurrentProbe(t *testing.T) {
+	b, err := New("http://127.0.0.1:8080", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.CircuitFailureThreshold = 1
+	b.CircuitCooldown = time.Millisecond
+	b.RecordFailure()
+	b.CircuitOpenedAt = time.Now().Add(-time.Second)
+
+	var probes atomic.Int32
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if b.AllowRequest() {
+				probes.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("concurrent half-open probes = %d; want exactly 1", got)
 	}
 }
 

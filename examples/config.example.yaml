@@ -1,5 +1,5 @@
 listen: ":8080"
-admin_listen: ":9090"
+admin_listen: "127.0.0.1:9090"
 log_level: "info"
 log_format: "json"
 strategy: "round_robin"
@@ -38,7 +38,7 @@ rate_limit:
   rate: 100
   burst: 200
   window: "1m"
-  trusted_proxy: false
+  trusted_proxies: []
 
 shutdown:
   grace_period: "15s"

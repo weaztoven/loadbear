@@ -99,7 +99,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		requestID = newRequestID()
 	}
 	w.Header().Set("X-Request-ID", requestID)
-	clientIP := clientIP(r, h.config.RateLimit.TrustedProxy)
+	clientIP := clientIP(r, h.config.RateLimit.TrustedProxies)
 	var selected *backend.Backend
 	var requestError string
 	defer func() {
@@ -133,7 +133,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	selectionRequest := r.Clone(r.Context())
 	selectionRequest.RemoteAddr = clientIP
-	selected = h.strategy.Select(h.currentBackends(), selectionRequest)
+	selected, probe := h.selectBackend(selectionRequest)
 	if selected == nil {
 		h.writePlainText(w, http.StatusServiceUnavailable, "no healthy backend available")
 		return
@@ -141,10 +141,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-Request-ID") == "" {
 		r.Header.Set("X-Request-ID", requestID)
 	}
-	clientIP = clientIPFromHeader(r, h.config.RateLimit.TrustedProxy)
+	clientIP = clientIPFromHeader(r, h.config.RateLimit.TrustedProxies)
 	forwardedFor := clientIP
-	if h.config.RateLimit.TrustedProxy && r.Header.Get("X-Forwarded-For") != "" {
-		forwardedFor = strings.TrimSpace(r.Header.Get("X-Forwarded-For")) + ", " + clientIPFromHeader(r, false)
+	if isTrustedProxy(r.RemoteAddr, h.config.RateLimit.TrustedProxies) && r.Header.Get("X-Forwarded-For") != "" {
+		forwardedFor = strings.TrimSpace(r.Header.Get("X-Forwarded-For")) + ", " + remotePeerIP(r.RemoteAddr)
 	}
 	if r.Header.Get("X-Forwarded-Proto") == "" {
 		r.Header.Set("X-Forwarded-Proto", schemeFromRequest(r))
@@ -155,11 +155,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-Request-ID") == "" {
 		r.Header.Set("X-Request-ID", requestID)
 	}
-	var serveAttempt func(*backend.Backend, int)
-	serveAttempt = func(current *backend.Backend, attempt int) {
+	var serveAttempt func(*backend.Backend, int, *http.Request, bool)
+	serveAttempt = func(current *backend.Backend, attempt int, attemptRequest *http.Request, isProbe bool) {
 		selected = current
 		current.IncrementActive()
-		defer current.DecrementActive()
+		probeResolved := false
+		defer func() {
+			if isProbe && !probeResolved {
+				current.AbortHalfOpenProbe()
+			}
+			current.DecrementActive()
+		}()
 		reverseProxy := &httputil.ReverseProxy{
 			Transport: h.transport,
 			Rewrite: func(req *httputil.ProxyRequest) {
@@ -175,13 +181,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reverseProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			current.SetHealthy(false)
 			current.RecordFailure()
-			if retryableMethod(r.Method) && attempt < h.config.Proxy.RetryMaxAttempts {
-				if next := h.strategy.Select(h.currentBackends(), selectionRequest); next != nil && next != current {
-					if waitErr := waitForRetry(r.Context(), h.config.Proxy.RetryBackoff.Duration()); waitErr == nil {
-						serveAttempt(next, attempt+1)
-						return
-					} else {
+			probeResolved = true
+			if retryableMethod(r.Method) && requestBodyReplayable(r) &&
+				!response.wroteHeader() && attempt < h.config.Proxy.RetryMaxAttempts {
+				next, nextIsProbe := h.selectBackend(selectionRequest)
+				if nextIsProbe && next == current {
+					next.AbortHalfOpenProbe()
+				}
+				if next != nil && next != current {
+					retryProbeTransferred := false
+					if nextIsProbe {
+						defer func() {
+							if !retryProbeTransferred {
+								next.AbortHalfOpenProbe()
+							}
+						}()
+					}
+					retryRequest, replayErr := cloneReplayableRequest(r)
+					if replayErr != nil {
+						err = replayErr
+					} else if waitErr := waitForRetry(r.Context(), h.config.Proxy.RetryBackoff.Duration()); waitErr != nil {
 						err = waitErr
+					} else if contextErr := r.Context().Err(); contextErr != nil {
+						err = contextErr
+					} else {
+						retryProbeTransferred = true
+						serveAttempt(next, attempt+1, retryRequest, nextIsProbe)
+						return
 					}
 				}
 			}
@@ -198,15 +224,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reverseProxy.ModifyResponse = func(resp *http.Response) error {
 			resp.Header.Set("X-Request-ID", requestID)
 			current.RecordSuccess()
+			probeResolved = true
 			current.SetHealthy(true)
 			if h.metrics != nil {
 				h.metrics.RecordRequest(current, resp.StatusCode, time.Since(start))
 			}
 			return nil
 		}
-		reverseProxy.ServeHTTP(w, r)
+		reverseProxy.ServeHTTP(w, attemptRequest)
 	}
-	serveAttempt(selected, 1)
+	serveAttempt(selected, 1, r, probe)
+}
+
+func (h *Handler) selectBackend(req *http.Request) (*backend.Backend, bool) {
+	backends := h.currentBackends()
+	if strategy, ok := h.strategy.(balancer.ProbeStrategy); ok {
+		return strategy.SelectWithProbe(backends, req)
+	}
+	return h.strategy.Select(backends, req), false
 }
 
 type statusWriter struct {
@@ -240,6 +275,32 @@ func (w *statusWriter) statusCode() int {
 	return w.status
 }
 
+func (w *statusWriter) wroteHeader() bool {
+	return w.status != 0
+}
+
+func requestBodyReplayable(r *http.Request) bool {
+	return r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 || r.GetBody != nil
+}
+
+func cloneReplayableRequest(r *http.Request) (*http.Request, error) {
+	clone := r.Clone(r.Context())
+	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
+		clone.Body = http.NoBody
+		return clone, nil
+	}
+	if r.GetBody == nil {
+		return nil, errors.New("request body is not replayable")
+	}
+	body, err := r.GetBody()
+	if err != nil {
+		return nil, fmt.Errorf("recreate request body for retry: %w", err)
+	}
+	clone.Body = body
+	clone.GetBody = r.GetBody
+	return clone, nil
+}
+
 func backendName(b *backend.Backend) string {
 	if b == nil {
 		return ""
@@ -252,6 +313,9 @@ func isHealthOrAdminPath(path string) bool {
 }
 
 func waitForRetry(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if delay <= 0 {
 		return nil
 	}
@@ -259,7 +323,7 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return nil
+		return ctx.Err()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -307,32 +371,58 @@ func newRequestID() string {
 	return hex.EncodeToString(buf)
 }
 
-func clientIP(r *http.Request, trustedProxy bool) string {
-	if trustedProxy {
-		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-			parts := strings.Split(forwarded, ",")
-			if len(parts) > 0 {
-				return strings.TrimSpace(parts[0])
-			}
+func clientIP(r *http.Request, trustedProxies []string) string {
+	peerIP := remotePeerIP(r.RemoteAddr)
+	if isTrustedProxy(r.RemoteAddr, trustedProxies) {
+		if forwarded := firstForwardedIP(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+			return forwarded
 		}
 	}
-	addr := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		return host
-	}
-	return addr
+	return peerIP
 }
 
-func clientIPFromHeader(r *http.Request, trustedProxy bool) string {
-	if trustedProxy {
-		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-			parts := strings.Split(forwarded, ",")
-			if len(parts) > 0 {
-				return strings.TrimSpace(parts[0])
-			}
+func clientIPFromHeader(r *http.Request, trustedProxies []string) string {
+	return clientIP(r, trustedProxies)
+}
+
+func remotePeerIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return strings.Split(host, "%")[0]
+	}
+	if ip := net.ParseIP(strings.Trim(remoteAddr, "[]")); ip != nil {
+		return ip.String()
+	}
+	return remoteAddr
+}
+
+func isTrustedProxy(remoteAddr string, trustedProxies []string) bool {
+	peerIP := net.ParseIP(remotePeerIP(remoteAddr))
+	if peerIP == nil {
+		return false
+	}
+	for _, trustedProxy := range trustedProxies {
+		trustedProxy = strings.TrimSpace(trustedProxy)
+		if ip := net.ParseIP(trustedProxy); ip != nil && ip.Equal(peerIP) {
+			return true
+		}
+		if _, network, err := net.ParseCIDR(trustedProxy); err == nil && network.Contains(peerIP) {
+			return true
 		}
 	}
-	return clientIP(r, false)
+	return false
+}
+
+func firstForwardedIP(header string) string {
+	if header == "" {
+		return ""
+	}
+	first := strings.TrimSpace(strings.Split(header, ",")[0])
+	ip := net.ParseIP(strings.Trim(first, "[]"))
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 func schemeFromRequest(r *http.Request) string {

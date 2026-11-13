@@ -17,7 +17,7 @@ flowchart LR
     AdminListener --> Metrics
 ```
 
-Proxy requests are rate limited before the configured strategy selects a healthy backend whose circuit allows a request. The reverse proxy forwards the request and tracks backend connection and request counters. GET, HEAD, and OPTIONS requests may be retried on another backend after an upstream error.
+Proxy requests are rate limited before the configured strategy selects a healthy backend whose circuit allows a request. An expired open circuit admits only one concurrent half-open probe. The reverse proxy forwards the request and tracks backend connection and request counters. GET, HEAD, and OPTIONS requests with no body or a replayable body may be retried on another backend after an upstream error, provided no response has been committed; retry attempts share the original request context.
 
 The active health checker periodically requests the configured health path. It applies the configured consecutive-failure and consecutive-success thresholds to health-check results. A proxy error separately marks its backend unhealthy. The admin listener is separate from the proxy listener and serves only `/status` and `/metrics`.
 
@@ -31,4 +31,4 @@ The active health checker periodically requests the configured health path. It a
 - `internal/metrics`: status snapshots and hand-written Prometheus text output.
 - `internal/config`: YAML defaults, environment overrides, and validation.
 
-WebSocket upgrades, SIGHUP reload, and automatic stale rate-limit bucket eviction are not implemented or verified.
+WebSocket upgrades and SIGHUP reload are not implemented or verified. The admin listener defaults to loopback; Docker configuration explicitly binds it inside the container.

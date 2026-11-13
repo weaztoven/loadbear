@@ -187,6 +187,31 @@ func TestRetryOnlyForIdempotentMethods(t *testing.T) {
 	}
 }
 
+func TestRetryAfterAcceptedConnectionClosesBeforeHeaders(t *testing.T) {
+	closeBeforeHeaders := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer closeBeforeHeaders.Close()
+	var fallbackHits atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, "retried")
+	}))
+	defer fallback.Close()
+	h, _ := testHandler(t, testConfig(), fallback, closeBeforeHeaders)
+	res := perform(h, http.MethodGet, make(http.Header))
+	if res.Code != http.StatusAccepted || res.Body.String() != "retried" {
+		t.Fatalf("retry response = %d %q", res.Code, res.Body.String())
+	}
+	if got := fallbackHits.Load(); got != 1 {
+		t.Fatalf("fallback hits = %d; want 1", got)
+	}
+}
+
 func TestRetryBackoffDelaysNextAttempt(t *testing.T) {
 	failing := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	failingURL := failing.URL
@@ -287,6 +312,355 @@ func TestRetryBackoffStopsWhenRequestContextIsCancelled(t *testing.T) {
 	}
 }
 
+func TestRetryDoesNotReplayNonReplayableRequestBody(t *testing.T) {
+	var fallbackHits atomic.Int32
+	failing := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	failingURL := failing.URL
+	failing.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer fallback.Close()
+	h, _ := testHandler(t, testConfig(), fallback, mustServerURL(t, failingURL))
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.test/body", nil)
+	req.Body = io.NopCloser(strings.NewReader("not replayable"))
+	req.ContentLength = int64(len("not replayable"))
+	req.GetBody = nil
+	req.RemoteAddr = "192.0.2.10:1234"
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d; want 502 because request body cannot be replayed", recorder.Code)
+	}
+	if got := fallbackHits.Load(); got != 0 {
+		t.Fatalf("non-replayable request body was retried %d times", got)
+	}
+}
+
+func TestRetryReplaysBodyWhenGetBodyIsAvailable(t *testing.T) {
+	var received string
+	failing := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	failingURL := failing.URL
+	failing.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received = string(body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer fallback.Close()
+	h, _ := testHandler(t, testConfig(), fallback, mustServerURL(t, failingURL))
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.test/replay", nil)
+	body := "replayable payload"
+	req.Body = io.NopCloser(strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(body)), nil
+	}
+	req.RemoteAddr = "192.0.2.10:1234"
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted || received != body {
+		t.Fatalf("retry status/body = %d/%q; want 202/%q", recorder.Code, received, body)
+	}
+}
+
+func TestRetryBudgetHonorsOriginalRequestDeadline(t *testing.T) {
+	var backendHits atomic.Int32
+	hang := func(_ http.ResponseWriter, r *http.Request) {
+		backendHits.Add(1)
+		<-r.Context().Done()
+	}
+	first := httptest.NewServer(http.HandlerFunc(hang))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hang(w, r)
+	}))
+	defer second.Close()
+	cfg := testConfig()
+	cfg.Proxy.RetryBackoff = config.YAMLDuration(time.Second)
+	h, _ := testHandler(t, cfg, first, second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.test/deadline", nil).WithContext(ctx)
+	req.RemoteAddr = "192.0.2.10:1234"
+	start := time.Now()
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("request exceeded original deadline by too much: %s", elapsed)
+	}
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d; want 504", recorder.Code)
+	}
+	if got := backendHits.Load(); got != 1 {
+		t.Fatalf("attempts = %d; want one attempt before original deadline", got)
+	}
+}
+
+func TestRetryDoesNotRetryAfterResponseHeaders(t *testing.T) {
+	var fallbackHits atomic.Int32
+	drop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "partial")
+		w.(http.Flusher).Flush()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer drop.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		_, _ = io.WriteString(w, "fallback")
+	}))
+	defer fallback.Close()
+	cfg := testConfig()
+	h, _ := testHandler(t, cfg, fallback, drop)
+	proxyServer := httptest.NewServer(h)
+	defer proxyServer.Close()
+
+	resp, err := http.Get(proxyServer.URL + "/drop-mid")
+	if err != nil {
+		t.Fatalf("client did not receive committed upstream response headers: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; want already-committed 200", resp.StatusCode)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr == nil {
+		t.Fatalf("expected truncated response body, got %q", body)
+	}
+	if got := fallbackHits.Load(); got != 0 {
+		t.Fatalf("proxy retried after response headers and reached fallback %d times", got)
+	}
+}
+
+func TestLeastConnectionsActiveCountReleasedOnTimeoutAndCancel(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		cancel bool
+	}{
+		{name: "upstream timeout"},
+		{name: "client cancellation", cancel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			started := make(chan struct{}, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				started <- struct{}{}
+				<-r.Context().Done()
+			}))
+			defer server.Close()
+			cfg := testConfig()
+			cfg.Strategy = "least_connections"
+			cfg.Proxy.ResponseHeaderTimeout = config.YAMLDuration(60 * time.Millisecond)
+			h, backends := testHandler(t, cfg, server)
+			proxyServer := httptest.NewServer(h)
+			defer proxyServer.Close()
+			requestContext := context.Background()
+			var cancel context.CancelFunc
+			if test.cancel {
+				requestContext, cancel = context.WithCancel(requestContext)
+				defer cancel()
+			}
+			req, err := http.NewRequestWithContext(requestContext, http.MethodGet, proxyServer.URL+"/wait", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() {
+				resp, err := http.DefaultClient.Do(req)
+				if err == nil {
+					_, err = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+				}
+				result <- err
+			}()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("upstream request did not start")
+			}
+			if test.cancel {
+				cancel()
+			}
+			select {
+			case <-result:
+			case <-time.After(time.Second):
+				t.Fatal("proxy request did not terminate")
+			}
+			deadline := time.Now().Add(time.Second)
+			for backends[0].ActiveConnections.Load() != 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if got := backends[0].ActiveConnections.Load(); got != 0 {
+				t.Fatalf("active connection count = %d after request ended", got)
+			}
+		})
+	}
+}
+
+func TestCancelledHalfOpenProbeCanBeAdmittedAgain(t *testing.T) {
+	started := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	cfg := testConfig()
+	h, backends := testHandler(t, cfg, server)
+	b := backends[0]
+	b.CircuitFailureThreshold = 1
+	b.CircuitCooldown = time.Hour
+	b.RecordFailure()
+	b.CircuitOpenedAt = time.Now().Add(-2 * time.Hour)
+
+	proxyDone := make(chan struct{})
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r)
+		close(proxyDone)
+	}))
+	defer proxyServer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, proxyServer.URL+"/cancel-probe", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("half-open probe did not reach backend")
+	}
+	cancel()
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled probe did not return")
+	}
+	select {
+	case <-proxyDone:
+	case <-time.After(time.Second):
+		t.Fatal("proxy handler did not finish after cancellation")
+	}
+	if state := b.GetCircuitState(); state != backend.CircuitOpen {
+		t.Fatalf("circuit state after cancelled probe = %q; want open", state)
+	}
+	b.CircuitOpenedAt = time.Now().Add(-2 * time.Hour)
+	b.SetHealthy(true)
+	selected := h.strategy.Select(backends, httptest.NewRequest(http.MethodGet, "/", nil))
+	if selected != b || b.GetCircuitState() != backend.CircuitHalfOpen {
+		t.Fatalf("probe slot was not released after cancellation: selected=%v state=%q", selected, b.GetCircuitState())
+	}
+	b.AbortHalfOpenProbe()
+}
+
+func TestPanickingHalfOpenProbeReleasesSlot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	h, backends := testHandler(t, testConfig(), server)
+	b := backends[0]
+	b.CircuitFailureThreshold = 1
+	b.CircuitCooldown = time.Hour
+	b.RecordFailure()
+	b.CircuitOpenedAt = time.Now().Add(-2 * time.Hour)
+	b.URL = nil
+	h.logger = nil
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected reverse proxy to panic with a nil backend URL")
+			}
+		}()
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+	if state := b.GetCircuitState(); state != backend.CircuitOpen {
+		t.Fatalf("circuit state after panicking probe = %q; want open", state)
+	}
+	b.URL, _ = url.Parse(server.URL)
+	b.CircuitOpenedAt = time.Now().Add(-2 * time.Hour)
+	if !b.AllowRequest() {
+		t.Fatal("probe slot remained occupied after panic")
+	}
+	b.AbortHalfOpenProbe()
+}
+
+func TestLeastConnectionsActiveCountReleasedOnSuccessAndUpstreamError(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		closeServer bool
+		wantStatus  int
+	}{
+		{name: "success", wantStatus: http.StatusOK},
+		{name: "upstream error", closeServer: true, wantStatus: http.StatusBadGateway},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			serverURL := server.URL
+			if test.closeServer {
+				server.Close()
+			} else {
+				defer server.Close()
+			}
+			cfg := testConfig()
+			cfg.Strategy = "least_connections"
+			h, backends := testHandler(t, cfg, mustServerURL(t, serverURL))
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "http://proxy.test/accounting", nil)
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d; want %d", recorder.Code, test.wantStatus)
+			}
+			if got := backends[0].ActiveConnections.Load(); got != 0 {
+				t.Fatalf("active connection count = %d after request", got)
+			}
+		})
+	}
+}
+
+func TestLeastConnectionsActiveCountReleasedOnPanic(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "body")
+	}))
+	defer server.Close()
+	cfg := testConfig()
+	cfg.Strategy = "least_connections"
+	h, backends := testHandler(t, cfg, server)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected writer panic")
+		}
+		if got := backends[0].ActiveConnections.Load(); got != 0 {
+			t.Fatalf("active connection count = %d after panic", got)
+		}
+	}()
+	h.ServeHTTP(panicResponseWriter{header: make(http.Header)}, httptest.NewRequest(http.MethodGet, "http://proxy.test/panic", nil))
+}
+
+type panicResponseWriter struct {
+	header http.Header
+}
+
+func (w panicResponseWriter) Header() http.Header { return w.header }
+func (panicResponseWriter) WriteHeader(int)       {}
+func (panicResponseWriter) Write([]byte) (int, error) {
+	panic("writer failure")
+}
+
 func mustServerURL(t *testing.T, raw string) *httptest.Server {
 	t.Helper()
 	parsed, err := url.Parse(raw)
@@ -313,12 +687,13 @@ func TestCircuitBreakerTransitions(t *testing.T) {
 	}
 	b.CircuitCooldown = time.Nanosecond
 	b.CircuitOpenedAt = time.Now().Add(-time.Second)
-	if !b.AllowRequest() || string(b.CircuitState) != "half-open" {
-		t.Fatalf("circuit did not enter half-open: %q", b.CircuitState)
+	if selected := h.strategy.Select(backends, httptest.NewRequest(http.MethodGet, "/", nil)); selected != b ||
+		b.GetCircuitState() != backend.CircuitHalfOpen {
+		t.Fatalf("strategy did not admit half-open probe: selected=%v state=%q", selected, b.GetCircuitState())
 	}
-	res := perform(h, http.MethodGet, make(http.Header))
-	if res.Code != http.StatusOK || string(b.CircuitState) != "closed" {
-		t.Fatalf("successful probe response/state = %d/%q", res.Code, b.CircuitState)
+	b.RecordSuccess()
+	if b.GetCircuitState() != backend.CircuitClosed {
+		t.Fatalf("successful probe did not close circuit: %q", b.GetCircuitState())
 	}
 }
 
@@ -418,11 +793,17 @@ func TestRateLimitResponseAndTrustedForwarding(t *testing.T) {
 	}
 
 	cfg = testConfig()
-	cfg.RateLimit.TrustedProxy = true
+	cfg.RateLimit.TrustedProxies = []string{"192.0.2.0/24"}
 	h, _ = testHandler(t, cfg, server)
 	res = perform(h, http.MethodGet, headers)
 	if res.Code != http.StatusOK || received != "198.51.100.10, 192.0.2.10" {
 		t.Fatalf("trusted proxy request = %d, XFF %q", res.Code, received)
+	}
+	cfg.RateLimit.TrustedProxies = []string{"203.0.113.0/24"}
+	h, _ = testHandler(t, cfg, server)
+	res = perform(h, http.MethodGet, headers)
+	if res.Code != http.StatusOK || received != "192.0.2.10" {
+		t.Fatalf("untrusted direct peer spoofed XFF: status=%d XFF=%q", res.Code, received)
 	}
 }
 
@@ -454,13 +835,16 @@ func TestClientIPAndRequestIDHelpers(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.test/", nil)
 	req.RemoteAddr = "192.0.2.3:1234"
 	req.Header.Set("X-Forwarded-For", "198.51.100.8, 192.0.2.1")
-	if got := clientIP(req, false); got != "192.0.2.3" {
+	if got := clientIP(req, nil); got != "192.0.2.3" {
 		t.Fatalf("untrusted client IP = %q", got)
 	}
-	if got := clientIP(req, true); got != "198.51.100.8" {
+	if got := clientIP(req, []string{"192.0.2.0/24"}); got != "198.51.100.8" {
 		t.Fatalf("trusted client IP = %q", got)
 	}
-	if got := clientIPFromHeader(req, false); got != "192.0.2.3" {
+	if got := clientIP(req, []string{"192.0.2.4"}); got != "192.0.2.3" {
+		t.Fatalf("spoofed client IP = %q", got)
+	}
+	if got := clientIPFromHeader(req, nil); got != "192.0.2.3" {
 		t.Fatalf("untrusted forwarded IP = %q", got)
 	}
 	if got := requestIDFromHeader(req); got != "" {

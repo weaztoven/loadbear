@@ -47,6 +47,7 @@ func TestConfigValidation(t *testing.T) {
 		{name: "rate", change: func(c *Config) { c.RateLimit.Rate = 0 }, wantField: "rate_limit.rate"},
 		{name: "burst", change: func(c *Config) { c.RateLimit.Burst = 0 }, wantField: "rate_limit.burst"},
 		{name: "rate window", change: func(c *Config) { c.RateLimit.Window = 0 }, wantField: "rate_limit.window"},
+		{name: "invalid trusted proxy", change: func(c *Config) { c.RateLimit.TrustedProxies = []string{"not-an-ip"} }, wantField: "rate_limit.trusted_proxies[0]"},
 		{name: "shutdown grace", change: func(c *Config) { c.Shutdown.GracePeriod = 0 }, wantField: "shutdown.grace_period"},
 	}
 	for _, test := range tests {
@@ -60,6 +61,7 @@ func TestConfigValidation(t *testing.T) {
 		})
 	}
 	valid := validConfig()
+	valid.RateLimit.TrustedProxies = []string{"127.0.0.1", "192.0.2.0/24", "2001:db8::/32"}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
@@ -67,7 +69,7 @@ func TestConfigValidation(t *testing.T) {
 
 func TestLoadDefaultsAndEnvironmentOverrides(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("backends:\n  - url: http://127.0.0.1:8081\n    weight: 1\n")
+	data := []byte("backends:\n  - url: http://127.0.0.1:8081\n    weight: 1\nrate_limit:\n  trusted_proxies: [127.0.0.1, 192.0.2.0/24]\n")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +82,9 @@ func TestLoadDefaultsAndEnvironmentOverrides(t *testing.T) {
 	if cfg.Listen != ":8181" || cfg.LogLevel != "debug" {
 		t.Fatalf("environment overrides not applied: listen=%q log=%q", cfg.Listen, cfg.LogLevel)
 	}
+	if len(cfg.RateLimit.TrustedProxies) != 2 || cfg.RateLimit.TrustedProxies[1] != "192.0.2.0/24" {
+		t.Fatalf("trusted proxy list not parsed: %#v", cfg.RateLimit.TrustedProxies)
+	}
 	defaults := DefaultConfig()
 	if cfg.AdminListen != defaults.AdminListen || cfg.LogFormat != defaults.LogFormat ||
 		cfg.Strategy != defaults.Strategy || cfg.Health.Path != defaults.Health.Path ||
@@ -88,6 +93,9 @@ func TestLoadDefaultsAndEnvironmentOverrides(t *testing.T) {
 		cfg.RateLimit.Burst != defaults.RateLimit.Burst ||
 		cfg.Shutdown.GracePeriod.Duration() != defaults.Shutdown.GracePeriod.Duration() {
 		t.Fatalf("optional YAML fields did not keep defaults: %+v", cfg)
+	}
+	if defaults.AdminListen != "127.0.0.1:9090" {
+		t.Fatalf("admin listen default = %q", defaults.AdminListen)
 	}
 }
 

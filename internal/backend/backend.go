@@ -35,6 +35,7 @@ type Backend struct {
 	CircuitOpenedAt         time.Time
 	circuitMux              sync.Mutex
 	consecutiveFailures     int32
+	halfOpenProbeInFlight   bool
 }
 
 func New(rawURL string, weight int) (*Backend, error) {
@@ -91,11 +92,13 @@ func (b *Backend) RecordFailure() {
 	if b.CircuitState == CircuitHalfOpen {
 		b.CircuitState = CircuitOpen
 		b.CircuitOpenedAt = time.Now()
+		b.halfOpenProbeInFlight = false
 		return
 	}
 	if b.CircuitState == CircuitClosed && int(b.consecutiveFailures) >= b.CircuitFailureThreshold {
 		b.CircuitState = CircuitOpen
 		b.CircuitOpenedAt = time.Now()
+		b.halfOpenProbeInFlight = false
 	}
 }
 
@@ -106,27 +109,73 @@ func (b *Backend) RecordSuccess() {
 	if b.CircuitState == CircuitOpen {
 		if time.Since(b.CircuitOpenedAt) >= b.CircuitCooldown {
 			b.CircuitState = CircuitClosed
+			b.halfOpenProbeInFlight = false
 		}
 	}
 	if b.CircuitState == CircuitHalfOpen {
 		b.CircuitState = CircuitClosed
+		b.halfOpenProbeInFlight = false
 	}
 }
 
 func (b *Backend) AllowRequest() bool {
+	allowed, _ := b.AllowRequestWithProbe()
+	return allowed
+}
+
+func (b *Backend) AllowRequestWithProbe() (bool, bool) {
 	b.circuitMux.Lock()
 	defer b.circuitMux.Unlock()
 	if b.CircuitState == CircuitOpen {
 		if time.Since(b.CircuitOpenedAt) >= b.CircuitCooldown {
 			b.CircuitState = CircuitHalfOpen
-			return true
+			b.halfOpenProbeInFlight = true
+			return true, true
 		}
-		return false
+		return false, false
 	}
 	if b.CircuitState == CircuitHalfOpen {
-		return true
+		if b.halfOpenProbeInFlight {
+			return false, false
+		}
+		b.halfOpenProbeInFlight = true
+		return true, true
 	}
-	return true
+	return true, false
+}
+
+func (b *Backend) AbortHalfOpenProbe() {
+	b.circuitMux.Lock()
+	defer b.circuitMux.Unlock()
+	if b.CircuitState != CircuitHalfOpen || !b.halfOpenProbeInFlight {
+		return
+	}
+	b.TotalFailures.Add(1)
+	b.consecutiveFailures++
+	b.CircuitState = CircuitOpen
+	b.CircuitOpenedAt = time.Now()
+	b.halfOpenProbeInFlight = false
+}
+
+func (b *Backend) CircuitAvailable() bool {
+	b.circuitMux.Lock()
+	defer b.circuitMux.Unlock()
+	switch b.CircuitState {
+	case CircuitClosed:
+		return true
+	case CircuitOpen:
+		return time.Since(b.CircuitOpenedAt) >= b.CircuitCooldown
+	case CircuitHalfOpen:
+		return !b.halfOpenProbeInFlight
+	default:
+		return false
+	}
+}
+
+func (b *Backend) GetCircuitState() CircuitState {
+	b.circuitMux.Lock()
+	defer b.circuitMux.Unlock()
+	return b.CircuitState
 }
 
 func (b *Backend) Export() map[string]any {
@@ -137,7 +186,7 @@ func (b *Backend) Export() map[string]any {
 		"active_connections": b.ActiveConnections.Load(),
 		"total_requests":     b.TotalRequests.Load(),
 		"total_failures":     b.TotalFailures.Load(),
-		"circuit_state":      string(b.CircuitState),
+		"circuit_state":      string(b.GetCircuitState()),
 		"weight":             b.Weight,
 	}
 }

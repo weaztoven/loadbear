@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Single-probe admission for half-open backend circuit breakers.
+- Fake backend modes for hanging, closing before headers, dropping mid-response, and slow responses.
+
+### Changed
+
+- Admin listener defaults to `127.0.0.1:9090`; Docker config binds to `:9090` inside its network namespace.
+- Forwarded client IP trust now uses `rate_limit.trusted_proxies`, a list of trusted IPs/CIDRs. This replaces the legacy `rate_limit.trusted_proxy` boolean; configurations using the old key must migrate.
+- Retries require a replayable request body and an uncommitted response, and continue to use the original request context.
+
 ## [0.1.0] - 2026-11-12
 
 ### Added

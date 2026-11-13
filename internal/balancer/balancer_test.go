@@ -3,7 +3,10 @@ package balancer
 import (
 	"fmt"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/weaztoven/loadbear/internal/backend"
 )
@@ -128,6 +131,41 @@ func TestLeastConnectionsTieUnhealthyAndEmpty(t *testing.T) {
 	b2.SetHealthy(false)
 	if got := strategy.Select([]*backend.Backend{b1, b2}, nil); got != nil {
 		t.Fatalf("selection with no candidates = %v", got)
+	}
+}
+
+func TestConcurrentHalfOpenSelectionFallsBackToAnotherBackend(t *testing.T) {
+	breaker := mustBackend(t, "http://127.0.0.1:8081", 1)
+	fallback := mustBackend(t, "http://127.0.0.1:8082", 1)
+	breaker.CircuitFailureThreshold = 1
+	breaker.CircuitCooldown = time.Millisecond
+	breaker.RecordFailure()
+	breaker.CircuitOpenedAt = time.Now().Add(-time.Second)
+	strategy := &LeastConnections{}
+	var probeSelections atomic.Int32
+	var fallbackSelections atomic.Int32
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			selected := strategy.Select([]*backend.Backend{breaker, fallback}, nil)
+			switch selected {
+			case breaker:
+				probeSelections.Add(1)
+			case fallback:
+				fallbackSelections.Add(1)
+			default:
+				t.Error("selection returned no backend while fallback was healthy")
+			}
+		}()
+	}
+	wg.Wait()
+	if got := probeSelections.Load(); got != 1 {
+		t.Fatalf("half-open probe selections = %d; want 1", got)
+	}
+	if got := fallbackSelections.Load(); got != 99 {
+		t.Fatalf("fallback selections = %d; want 99", got)
 	}
 }
 
