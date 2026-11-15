@@ -6,6 +6,9 @@ LDFLAGS = -ldflags "-X github.com/weaztoven/loadbear/internal/version.Version=$(
 
 ifeq ($(OS),Windows_NT)
 EXE = .exe
+BENCH_CMD = powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bench.ps1
+else
+BENCH_CMD = bash scripts/bench.sh
 endif
 
 build:
@@ -26,7 +29,7 @@ cover:
 	$(GO) tool cover -func=coverage.out
 
 bench:
-	$(GO) test -bench . -benchmem ./...
+	$(BENCH_CMD)
 
 lint:
 	$(GO) vet ./...

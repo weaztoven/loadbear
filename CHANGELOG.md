@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Standard-library `cmd/loadgen` with bounded latency sampling and JSON/Markdown summaries.
+- Reproducible Linux/macOS and Windows benchmark scripts for direct-backend and proxy strategy scenarios.
 
 ## [0.2.0] - 2026-11-15
 

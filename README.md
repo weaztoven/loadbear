@@ -71,7 +71,6 @@ Run the load balancer and its three backends together:
 docker compose up --build
 ```
 
-
 ## Architecture
 
 ```mermaid
@@ -244,12 +243,65 @@ go test -cover ./internal/...
 
 Or use `make cover` for a coverage profile and function summary. CI also runs formatting, vet, race-enabled tests with coverage, and build checks.
 
+## Benchmarking
+
+The standard-library load generator reports throughput, errors, non-2xx responses, and latency percentiles using a bounded reservoir. The scripts build `loadbear`, `fakebackend`, and `loadgen`, choose free loopback ports, and run each scenario twice by default. Proxy scenarios disable rate limiting so 429 responses do not skew results and set `log_level: error` to suppress per-request access logs during the throughput measurement.
+
+Linux/macOS:
+
+```sh
+bash scripts/bench.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\bench.ps1
+```
+
+> **Note:** the results below were produced with `bench.ps1` on Windows. `bench.sh` has not been verified yet.
+
+The default run uses a 5-second warmup, a 10-second measured duration, and concurrency 64. Override these with `WARMUP`, `DURATION`, `CONCURRENCY`, and `RUNS` environment variables in the shell script, or with the corresponding parameters to `bench.ps1`. The scenarios are direct to one fake backend, through the proxy with one backend, and through the proxy with three backends under each supported strategy. The scripts print machine details, generated config, exact process/load-generator commands, and each JSON result.
+
+Results depend on the machine. The client, proxy, and fake backends share the same machine and CPU; the fake backend returns a tiny JSON body. These numbers are not a comparison with nginx or HAProxy.
+
+### Results
+
+Measured on **2026-11-15** with `.\scripts\bench.ps1` on **Microsoft Windows 11 Home 10.0.26200**, **AMD Ryzen 5 7600 6-Core Processor**, **6 physical / 12 logical CPU cores**, **Go go1.27.4 windows/amd64**. Every run used GET, a 5-second warmup, a 10-second measured window, and concurrency 64. Proxy configs set `rate_limit.enabled: false` and `log_level: error`. The load generator retains at most 100,000 latency samples for percentile calculations; max latency is tracked across all requests. The values below are the script's JSON outputs; requests/s and latency milliseconds are truncated to three decimal places by the generator.
+
+| Scenario | Run | Requests | Requests/s | Errors | Non-2xx | p50 ms | p90 ms | p99 ms | max ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Direct, one backend | 1 | 906611 | 90655.959 | 0 | 0 | 0.580 | 1.510 | 2.778 | 13.350 |
+| Direct, one backend | 2 | 915877 | 91579.249 | 0 | 0 | 0.577 | 1.510 | 2.759 | 24.686 |
+| Proxy, one backend | 1 | 243815 | 24375.732 | 0 | 0 | 2.295 | 4.486 | 8.086 | 39.479 |
+| Proxy, one backend | 2 | 257480 | 25741.825 | 0 | 0 | 2.228 | 4.268 | 6.866 | 28.744 |
+| Proxy, three backends, round robin | 1 | 285805 | 28575.910 | 0 | 0 | 2.068 | 3.831 | 5.857 | 24.744 |
+| Proxy, three backends, round robin | 2 | 281658 | 28161.169 | 0 | 0 | 2.099 | 3.871 | 5.996 | 34.200 |
+| Proxy, three backends, smooth weighted round robin | 1 | 284149 | 28412.040 | 0 | 0 | 2.096 | 3.839 | 5.753 | 34.234 |
+| Proxy, three backends, smooth weighted round robin | 2 | 279867 | 27982.070 | 0 | 0 | 2.125 | 3.887 | 6.152 | 29.200 |
+| Proxy, three backends, least connections | 1 | 273963 | 27393.040 | 0 | 0 | 2.098 | 3.975 | 6.209 | 24.823 |
+| Proxy, three backends, least connections | 2 | 269663 | 26962.817 | 0 | 0 | 2.135 | 3.985 | 6.322 | 32.576 |
+| Proxy, three backends, IP hash | 1 | 257712 | 25768.369 | 0 | 0 | 2.214 | 4.205 | 7.037 | 34.731 |
+| Proxy, three backends, IP hash | 2 | 268230 | 26819.126 | 0 | 0 | 2.166 | 4.097 | 6.286 | 12.578 |
+
+Each result comes from a single `bench.ps1` run with the default settings. Internally the script runs the load generator once per scenario and run, for example:
+
+```powershell
+loadgen --url "http://127.0.0.1:<port>/" --duration 10s --warmup 5s --concurrency 64 --method GET --format json
+```
+
+where `<port>` is a free loopback port chosen by the script. The script prints the exact commands, the generated configs and the machine details for every run.
+
+Rounded, and only as an indication for this machine: a direct connection reached about 91k requests/s with a median latency of about 0.6 ms, while going through loadbear reached about 25-28k requests/s with a median latency of about 2.1-2.3 ms. The difference between the proxy scenarios is within run-to-run variance, so the three-backend numbers are not evidence of scaling (all processes share the same CPU).
+
+The two-run results do not establish a reliable strategy ranking; no strategy is claimed to be faster from this sample.
+
 ## Known limitations and roadmap
 
 - WebSocket-style upgrades are verified only for an HTTP/1.1 upgrade handshake and bidirectional raw-byte echo through the proxy; this does not verify full RFC 6455 protocol behavior.
 - SIGHUP configuration reload is unavailable on Windows.
 - Metrics are a small hand-written Prometheus text endpoint, not a complete Prometheus client implementation.
-- Load/performance benchmarks are not currently provided.
+- The benchmark exercises local fake backends and does not represent production workloads.
 
 ## Security notes
 
