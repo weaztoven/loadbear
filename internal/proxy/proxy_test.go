@@ -348,19 +348,57 @@ func TestRetryOnlyForIdempotentMethods(t *testing.T) {
 }
 
 func TestDefaultCircuitFailureStatusesDoNotTreat429AsBreakerFailure(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			h, backends := testHandler(t, testConfig(), server)
+			for range 2 {
+				if got := perform(h, http.MethodGet, make(http.Header)).Code; got != status {
+					t.Fatalf("response status = %d, want %d", got, status)
+				}
+			}
+			if backends[0].GetCircuitState() != backend.CircuitClosed || backends[0].TotalFailures.Load() != 0 {
+				t.Fatalf("default %d behavior changed: state=%s failures=%d",
+					status, backends[0].GetCircuitState(), backends[0].TotalFailures.Load())
+			}
+		})
+	}
+}
+
+func TestDefaultFiveHundredResponsesOpenCircuitAfterThreshold(t *testing.T) {
+	var status atomic.Int32
+	var backendHits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
+		backendHits.Add(1)
+		w.WriteHeader(int(status.Load()))
 	}))
 	defer server.Close()
 	h, backends := testHandler(t, testConfig(), server)
-	for range 2 {
-		if got := perform(h, http.MethodGet, make(http.Header)).Code; got != http.StatusTooManyRequests {
-			t.Fatalf("response status = %d, want 429", got)
+	b := backends[0]
+	b.CircuitFailureThreshold = 3
+
+	for _, code := range []int{
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+	} {
+		status.Store(int32(code))
+		if got := perform(h, http.MethodGet, make(http.Header)).Code; got != code {
+			t.Fatalf("upstream status = %d, want %d", got, code)
 		}
 	}
-	if backends[0].GetCircuitState() != backend.CircuitClosed || backends[0].TotalFailures.Load() != 0 {
-		t.Fatalf("default 429 behavior changed: state=%s failures=%d",
-			backends[0].GetCircuitState(), backends[0].TotalFailures.Load())
+	if got := b.GetCircuitState(); got != backend.CircuitOpen {
+		t.Fatalf("circuit state after three consecutive 5xx responses = %q, want open", got)
+	}
+	if !b.IsHealthy() {
+		t.Fatal("upstream 5xx responses marked the backend unhealthy")
+	}
+	if got := b.TotalFailures.Load(); got != 3 || backendHits.Load() != 3 {
+		t.Fatalf("5xx counters: failures=%d backend requests=%d, want 3 each",
+			got, backendHits.Load())
 	}
 }
 

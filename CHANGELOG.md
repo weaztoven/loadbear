@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Behavior change:** With the default empty `proxy.circuit_failure_statuses`, consecutive upstream 5xx responses now accumulate toward `proxy.circuit_failure_threshold` and open the circuit. They still do not mark the backend unhealthy or trigger status-based retries.
+- The reverse proxy reuses response-copy buffers to reduce per-request allocation observed in the profile benchmark; request and response behavior is unchanged.
+
+### Fixed
+
+- Upstream 5xx responses no longer reset the consecutive circuit-failure count before being recorded. Unlisted 429/404 responses remain non-failures.
+- A health check canceled while reloading settings no longer marks its backend unhealthy.
+
+### Added
+
+- SIGHUP reload of health-check path, interval, timeout, and healthy/unhealthy thresholds. Changed settings replace the checker loop without overlapping loops and preserve health flags for unchanged backends.
+- Opt-in `admin.pprof_enabled` profiling handlers on the admin listener and a reproducible proxy profile benchmark.
+- A Linux CI benchmark smoke test that runs `loadgen` through the proxy and checks request/error counts without performance thresholds.
 
 ## [0.2.1] - 2026-11-15
 

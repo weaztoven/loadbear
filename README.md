@@ -21,8 +21,9 @@ loadbear is a small, dependency-light HTTP reverse proxy that distributes reques
 - Per-client-IP token-bucket rate limiting with periodic eviction of idle client buckets.
 - Structured access logs with request ID, client, backend, response status, and latency.
 - YAML configuration; `LOADBEAR_LISTEN` and `LOADBEAR_LOG_LEVEL` override their YAML values.
-- On Linux and macOS, SIGHUP reloads the backend list and selection strategy without interrupting in-flight requests.
+- On Linux and macOS, SIGHUP reloads the backend list, selection strategy, and health-check settings without interrupting in-flight proxy requests.
 - Separate admin listener with `/status` and `/metrics`.
+- Optional `net/http/pprof` handlers on the admin listener only.
 - Graceful server shutdown on SIGINT and SIGTERM.
 - Multi-stage Docker images and a Docker Compose demo.
 
@@ -100,6 +101,7 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 |---|---|---|---|
 | `listen` | string | `:8080` | Proxy HTTP listen address. Overridden by `LOADBEAR_LISTEN`. |
 | `admin_listen` | string | `127.0.0.1:9090` | Admin HTTP listen address. Docker config overrides this to `:9090` inside its container. |
+| `admin.pprof_enabled` | boolean | `false` | Register Go runtime profiling handlers on the admin listener only. Keep the admin listener private. |
 | `log_level` | string | `info` | Log verbosity: `debug`, `info`, `warn`, or `error`. Overridden by `LOADBEAR_LOG_LEVEL`. |
 | `log_format` | string | `json` | `json` selects JSON logging; other values use text logging. |
 | `strategy` | string | `round_robin` | Backend selection: `round_robin`, `smooth_weighted_round_robin`, `least_connections`, or `ip_hash`. |
@@ -120,9 +122,9 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 | `proxy.request_timeout` | duration | `30s` | HTTP server read and write timeout setting; a client request context/deadline also bounds all upstream attempts and backoff. |
 | `proxy.retry_max_attempts` | integer | `2` | Maximum total attempts for eligible requests, including the first selection. Retried requests must have no body or a `GetBody` replay function. |
 | `proxy.retry_backoff` | duration | `100ms` | Delay between retry attempts; waiting stops when the request context is cancelled. |
-| `proxy.circuit_failure_threshold` | integer | `5` | Consecutive failures before opening a backend circuit. |
+| `proxy.circuit_failure_threshold` | integer | `5` | Consecutive transport failures, upstream 5xx responses, or configured failure statuses before opening a backend circuit. |
 | `proxy.circuit_cooldown` | duration | `30s` | Time an open circuit waits before allowing one half-open probe. |
-| `proxy.circuit_failure_statuses` | list of integers | `[]` | Additional HTTP response statuses counted as circuit failures. Explicitly configured statuses can be retried for eligible GET/HEAD/OPTIONS requests with replayable bodies when another backend is available and no response has been committed. With the empty default, 5xx responses count as failures but do not trigger status-based retries. Startup-only. |
+| `proxy.circuit_failure_statuses` | list of integers | `[]` | Additional HTTP response statuses counted as circuit failures. Explicitly configured statuses can be retried for eligible GET/HEAD/OPTIONS requests with replayable bodies when another backend is available and no response has been committed. With the empty default, upstream 5xx responses count toward the consecutive-failure threshold but do not trigger status-based retries; 429 and 404 do not count unless listed. Startup-only. |
 | `rate_limit.enabled` | boolean | `true` | Enable per-client-IP request limiting. |
 | `rate_limit.rate` | number | `100` | Token refill rate per second. |
 | `rate_limit.burst` | integer | `200` | Maximum token bucket size. |
@@ -131,6 +133,8 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 | `shutdown.grace_period` | duration | `15s` | Grace period used during HTTP server shutdown. |
 
 See [examples/config.example.yaml](examples/config.example.yaml) and [examples/config.docker.yaml](examples/config.docker.yaml).
+
+An upstream 500, 502, or 503 contributes to the consecutive breaker-failure threshold and can open the circuit, but the HTTP response alone does not mark the backend unhealthy or trigger a retry. Transport errors mark the backend unhealthy and may be retried under the existing retry rules.
 
 ## Reloading configuration
 
@@ -146,9 +150,9 @@ In Docker, signal the running container:
 docker kill --signal=HUP <container>
 ```
 
-Only the backend list (URLs and weights) and selection strategy are reloaded. Backends with unchanged URLs keep their health, counters, and circuit-breaker state. In-flight requests to removed backends are allowed to finish. Invalid configuration is rejected and the old backend set remains active; bursts of SIGHUP are coalesced.
+The backend list (URLs and weights), selection strategy, and health-check settings (`health.path`, `health.interval`, `health.timeout`, `health.healthy_threshold`, and `health.unhealthy_threshold`) are reloaded. Backends with unchanged URLs keep their health flag, counters, and circuit-breaker state. If health settings change, loadbear cancels and waits for the old checker before starting a replacement; its per-backend consecutive check streaks reset, while each reused backend's health flag is preserved. An in-flight check canceled during this replacement is not recorded as a failure. In-flight proxy requests to removed backends are allowed to finish. Invalid configuration is rejected and the old settings remain active; bursts of SIGHUP are coalesced.
 
-All other settings are startup-only and require a restart, including proxy/admin listen addresses, timeouts and retry/circuit-breaker settings (including `proxy.circuit_failure_statuses`), health-check settings, rate limiting, and logging. SIGHUP reload is not available on Windows.
+All other settings are startup-only and require a restart, including proxy/admin listen addresses, proxy timeouts and retry/circuit-breaker settings (including `proxy.circuit_failure_statuses`), rate limiting, and logging. SIGHUP reload is not available on Windows.
 
 ## Graceful shutdown
 
@@ -167,7 +171,7 @@ Unhealthy or circuit-open backends are excluded by selection.
 
 ## Admin endpoints
 
-The admin listener defaults to port `9090`; these paths are not registered on the proxy listener.
+The admin listener defaults to port `9090`; `/status`, `/metrics`, and optional pprof paths are not registered on the proxy listener.
 
 The `/status` endpoint exposes backend URLs and topology. Keep the admin listener private and do not expose `/status` publicly; the default bind is loopback. Docker's example binds inside the container, while Compose publishes the host admin port only on `127.0.0.1`.
 
@@ -191,6 +195,8 @@ The `/status` endpoint exposes backend URLs and topology. Keep the admin listene
 ```
 
 `GET /metrics` returns Prometheus text with cumulative latency buckets, `_sum`/`_count`, per-backend request/failure counters, backend health/active-connection/circuit gauges, and a rate-limited counter. Per-backend request and failure counters include upstream attempts; global request and latency series describe the final proxied request result, while rate-limited requests have their own counter. Backend label values are escaped, and backend series are sorted for stable output.
+
+Go profiling is disabled by default. Set `admin.pprof_enabled: true` to enable `GET /debug/pprof/` and its standard profile handlers on the admin listener. These endpoints can expose runtime and application details and consume resources while collecting profiles; never expose the admin listener or pprof endpoints publicly.
 
 This example was generated by running the metrics implementation with three observations (8 ms, 20 s, and 5 ms), two attributed to the backend:
 
@@ -240,6 +246,18 @@ loadbear_circuit_state{backend="http://127.0.0.1:8081"} 0
 ```
 
 For example, query them at `http://localhost:9090/status` and `http://localhost:9090/metrics`.
+
+## Profiling
+
+Run the reproducible in-process proxy benchmark against an `httptest` fake backend, and collect CPU and allocation profiles:
+
+```sh
+go test ./cmd/loadbear -run '^$' -bench '^BenchmarkProxyProfile$' -benchtime=10s -benchmem -cpuprofile=cpu.prof -memprofile=allocs.prof
+go tool pprof -top cpu.prof
+go tool pprof -top -alloc_space allocs.prof
+```
+
+The benchmark reports allocations and logs the OS, Go version, and CPU count. These profiles cover the benchmark process, including its proxy and fake backend; they are not a production workload profile.
 
 ## Demo
 
@@ -337,10 +355,12 @@ The two-run results do not establish a reliable strategy ranking; no strategy is
 - SIGHUP configuration reload is unavailable on Windows.
 - Metrics are a small hand-written Prometheus text endpoint, not a complete Prometheus client implementation.
 - The benchmark exercises local fake backends and does not represent production workloads.
+- Failures after a WebSocket upgrade handshake are not fed to the circuit breaker; a 101 response is recorded as a success.
 
 ## Security notes
 
 - The admin endpoint reports backend topology. Bind it to loopback or a private network and do not publish it to the public internet.
+- Keep `admin.pprof_enabled` disabled unless actively profiling; pprof can disclose runtime details and consume significant CPU or memory. If enabled, keep the admin listener private.
 - Forwarded client IP headers are ignored by default. Configure `rate_limit.trusted_proxies` with only the exact proxy IPs or CIDRs you control.
 - The legacy `rate_limit.trusted_proxy` boolean is no longer supported; migrate to `trusted_proxies` (see [CHANGELOG.md](CHANGELOG.md)).
 

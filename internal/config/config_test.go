@@ -90,6 +90,17 @@ func TestCircuitFailureStatusesValidation(t *testing.T) {
 	}
 }
 
+func TestAdminPprofEnabledMustBeBoolean(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("backends:\n  - url: http://127.0.0.1:8081\n    weight: 1\nadmin:\n  pprof_enabled: enabled\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("non-boolean admin.pprof_enabled value was accepted")
+	}
+}
+
 func TestLoadDefaultsAndEnvironmentOverrides(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte("backends:\n  - url: http://127.0.0.1:8081\n    weight: 1\nrate_limit:\n  trusted_proxies: [127.0.0.1, 192.0.2.0/24]\n")
@@ -119,6 +130,9 @@ func TestLoadDefaultsAndEnvironmentOverrides(t *testing.T) {
 	}
 	if defaults.AdminListen != "127.0.0.1:9090" {
 		t.Fatalf("admin listen default = %q", defaults.AdminListen)
+	}
+	if defaults.Admin.PprofEnabled {
+		t.Fatal("admin pprof should be disabled by default")
 	}
 }
 
