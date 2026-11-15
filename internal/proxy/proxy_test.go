@@ -402,6 +402,30 @@ func TestDefaultFiveHundredResponsesOpenCircuitAfterThreshold(t *testing.T) {
 	}
 }
 
+func TestConfiguredCircuitFailureStatusesRemainAdditiveToDefault5xx(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	cfg := configWithCircuitFailureStatuses(t, []int{http.StatusTooManyRequests}, server.URL)
+	cfg.Proxy.CircuitFailureThreshold = 2
+	h, backends := testHandler(t, cfg, server)
+	b := backends[0]
+	b.CircuitFailureThreshold = 2
+
+	for range 2 {
+		if got := perform(h, http.MethodGet, make(http.Header)).Code; got != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", got)
+		}
+	}
+	if got := b.GetCircuitState(); got != backend.CircuitOpen {
+		t.Fatalf("circuit after two default 5xx responses with an added 429 status = %q, want open", got)
+	}
+	if !b.IsHealthy() {
+		t.Fatal("5xx responses alone should not mark the backend unhealthy")
+	}
+}
+
 func TestConfiguredCircuitFailureStatusesOpenAndRecover(t *testing.T) {
 	var status atomic.Int32
 	status.Store(http.StatusTooManyRequests)

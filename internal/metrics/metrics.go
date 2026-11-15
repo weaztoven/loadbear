@@ -11,6 +11,27 @@ import (
 	"github.com/weaztoven/loadbear/internal/backend"
 )
 
+const (
+	TunnelReasonClientClosed   = "client_closed"
+	TunnelReasonUpstreamClosed = "upstream_closed"
+	TunnelReasonUpstreamError  = "upstream_error"
+	TunnelReasonShutdownForced = "shutdown_forced"
+	TunnelReasonUnknown        = "unknown"
+)
+
+var tunnelCloseReasons = []string{
+	TunnelReasonClientClosed,
+	TunnelReasonUpstreamClosed,
+	TunnelReasonUpstreamError,
+	TunnelReasonShutdownForced,
+	TunnelReasonUnknown,
+}
+
+type tunnelClosedKey struct {
+	backend *backend.Backend
+	reason  string
+}
+
 type BackendStatus struct {
 	URL               string `json:"url"`
 	Name              string `json:"name"`
@@ -30,6 +51,13 @@ type Metrics struct {
 	latencyBuckets     []float64
 	latencyBucketCount []uint64
 	latencySum         float64
+	activeTunnels      int64
+	backendTunnels     map[*backend.Backend]int64
+	tunnelClosed       map[tunnelClosedKey]uint64
+	tunnelBuckets      []float64
+	tunnelBucketCount  []uint64
+	tunnelDurationSum  float64
+	tunnelDurationN    uint64
 }
 
 func New(backends []*backend.Backend) *Metrics {
@@ -38,6 +66,10 @@ func New(backends []*backend.Backend) *Metrics {
 		Backends:           append([]*backend.Backend(nil), backends...),
 		latencyBuckets:     buckets,
 		latencyBucketCount: make([]uint64, len(buckets)),
+		backendTunnels:     make(map[*backend.Backend]int64),
+		tunnelClosed:       make(map[tunnelClosedKey]uint64),
+		tunnelBuckets:      []float64{1, 5, 15, 60, 300, 900, 3600},
+		tunnelBucketCount:  make([]uint64, 7),
 	}
 }
 
@@ -45,6 +77,22 @@ func (m *Metrics) SetBackends(backends []*backend.Backend) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.Backends = append([]*backend.Backend(nil), backends...)
+	current := make(map[*backend.Backend]struct{}, len(backends))
+	for _, b := range backends {
+		if b != nil {
+			current[b] = struct{}{}
+		}
+	}
+	for b := range m.backendTunnels {
+		if _, ok := current[b]; !ok {
+			delete(m.backendTunnels, b)
+		}
+	}
+	for key := range m.tunnelClosed {
+		if _, ok := current[key.backend]; !ok {
+			delete(m.tunnelClosed, key)
+		}
+	}
 }
 
 func (m *Metrics) RecordRequest(b *backend.Backend, status int, latency time.Duration) {
@@ -81,6 +129,61 @@ func (m *Metrics) RecordRateLimited() {
 	m.mu.Lock()
 	m.rateLimitedCount++
 	m.mu.Unlock()
+}
+
+func (m *Metrics) RecordTunnelOpened(b *backend.Backend) {
+	m.mu.Lock()
+	m.activeTunnels++
+	if b != nil && m.hasBackendLocked(b) {
+		m.backendTunnels[b]++
+	}
+	m.mu.Unlock()
+}
+
+func (m *Metrics) RecordTunnelClosed(b *backend.Backend, reason string, duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activeTunnels > 0 {
+		m.activeTunnels--
+	}
+	if b != nil && m.hasBackendLocked(b) {
+		if m.backendTunnels[b] > 0 {
+			m.backendTunnels[b]--
+		}
+		if !isTunnelCloseReason(reason) {
+			reason = TunnelReasonUnknown
+		}
+		m.tunnelClosed[tunnelClosedKey{backend: b, reason: reason}]++
+	}
+	if duration < 0 {
+		duration = 0
+	}
+	seconds := duration.Seconds()
+	for i, bucket := range m.tunnelBuckets {
+		if seconds <= bucket {
+			m.tunnelBucketCount[i]++
+		}
+	}
+	m.tunnelDurationSum += seconds
+	m.tunnelDurationN++
+}
+
+func (m *Metrics) hasBackendLocked(candidate *backend.Backend) bool {
+	for _, current := range m.Backends {
+		if current == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func isTunnelCloseReason(reason string) bool {
+	for _, known := range tunnelCloseReasons {
+		if reason == known {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Metrics) Snapshot() []BackendStatus {
@@ -185,6 +288,39 @@ func (m *Metrics) PrometheusText() string {
 		}
 		fmt.Fprintf(&b, "loadbear_circuit_state{backend=\"%s\"} %d\n",
 			escapeLabel(backendItem.URL.String()), circuitStateValue(backendItem.GetCircuitState()))
+	}
+	b.WriteString("# HELP loadbear_active_tunnels Total number of active upgraded tunnels.\n")
+	b.WriteString("# TYPE loadbear_active_tunnels gauge\n")
+	fmt.Fprintf(&b, "loadbear_active_tunnels %d\n", m.activeTunnels)
+	b.WriteString("# HELP loadbear_backend_active_tunnels Active upgraded tunnels per backend.\n")
+	b.WriteString("# TYPE loadbear_backend_active_tunnels gauge\n")
+	for _, backendItem := range backends {
+		if backendItem == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "loadbear_backend_active_tunnels{backend=\"%s\"} %d\n",
+			escapeLabel(backendItem.URL.String()), m.backendTunnels[backendItem])
+	}
+	b.WriteString("# HELP loadbear_tunnel_duration_seconds Duration of completed upgraded tunnels in seconds.\n")
+	b.WriteString("# TYPE loadbear_tunnel_duration_seconds histogram\n")
+	for i, bucket := range m.tunnelBuckets {
+		label := strconv.FormatFloat(bucket, 'f', -1, 64)
+		fmt.Fprintf(&b, "loadbear_tunnel_duration_seconds_bucket{le=%q} %d\n", label, m.tunnelBucketCount[i])
+	}
+	fmt.Fprintf(&b, "loadbear_tunnel_duration_seconds_bucket{le=\"+Inf\"} %d\n", m.tunnelDurationN)
+	fmt.Fprintf(&b, "loadbear_tunnel_duration_seconds_sum %.9g\n", m.tunnelDurationSum)
+	fmt.Fprintf(&b, "loadbear_tunnel_duration_seconds_count %d\n", m.tunnelDurationN)
+	b.WriteString("# HELP loadbear_tunnel_closed_total Total number of closed upgraded tunnels by backend and reason.\n")
+	b.WriteString("# TYPE loadbear_tunnel_closed_total counter\n")
+	for _, backendItem := range backends {
+		if backendItem == nil {
+			continue
+		}
+		label := backendItem.URL.String()
+		for _, reason := range tunnelCloseReasons {
+			fmt.Fprintf(&b, "loadbear_tunnel_closed_total{backend=\"%s\",reason=\"%s\"} %d\n",
+				escapeLabel(label), reason, m.tunnelClosed[tunnelClosedKey{backend: backendItem, reason: reason}])
+		}
 	}
 	return b.String()
 }

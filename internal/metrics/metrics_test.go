@@ -67,6 +67,8 @@ func TestPrometheusHistogramIsCumulativeAndIncludesSumAndCount(t *testing.T) {
 	collector.RecordRequest(b, http.StatusOK, 8*time.Millisecond)
 	collector.RecordRequest(b, http.StatusInternalServerError, 20*time.Second)
 	collector.RecordRequest(nil, http.StatusServiceUnavailable, 5*time.Millisecond)
+	collector.RecordTunnelOpened(b)
+	collector.RecordTunnelClosed(b, "upstream_error", 75*time.Second)
 
 	want := `# HELP loadbear_requests_total Total number of proxied requests.
 # TYPE loadbear_requests_total counter
@@ -110,10 +112,36 @@ loadbear_backend_active_connections{backend="http://127.0.0.1:8081"} 1
 # HELP loadbear_circuit_state Backend circuit state (0 closed, 1 open, 2 half-open).
 # TYPE loadbear_circuit_state gauge
 loadbear_circuit_state{backend="http://127.0.0.1:8081"} 0
+# HELP loadbear_active_tunnels Total number of active upgraded tunnels.
+# TYPE loadbear_active_tunnels gauge
+loadbear_active_tunnels 0
+# HELP loadbear_backend_active_tunnels Active upgraded tunnels per backend.
+# TYPE loadbear_backend_active_tunnels gauge
+loadbear_backend_active_tunnels{backend="http://127.0.0.1:8081"} 0
+# HELP loadbear_tunnel_duration_seconds Duration of completed upgraded tunnels in seconds.
+# TYPE loadbear_tunnel_duration_seconds histogram
+loadbear_tunnel_duration_seconds_bucket{le="1"} 0
+loadbear_tunnel_duration_seconds_bucket{le="5"} 0
+loadbear_tunnel_duration_seconds_bucket{le="15"} 0
+loadbear_tunnel_duration_seconds_bucket{le="60"} 0
+loadbear_tunnel_duration_seconds_bucket{le="300"} 1
+loadbear_tunnel_duration_seconds_bucket{le="900"} 1
+loadbear_tunnel_duration_seconds_bucket{le="3600"} 1
+loadbear_tunnel_duration_seconds_bucket{le="+Inf"} 1
+loadbear_tunnel_duration_seconds_sum 75
+loadbear_tunnel_duration_seconds_count 1
+# HELP loadbear_tunnel_closed_total Total number of closed upgraded tunnels by backend and reason.
+# TYPE loadbear_tunnel_closed_total counter
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="client_closed"} 0
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="upstream_closed"} 0
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="upstream_error"} 1
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="shutdown_forced"} 0
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="unknown"} 0
 `
 	if got := collector.PrometheusText(); got != want {
 		t.Fatalf("Prometheus output mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
+	t.Log(want)
 }
 
 func TestPrometheusLabelsUseFullBackendURL(t *testing.T) {
@@ -138,6 +166,7 @@ func TestPrometheusOutputTracksBackendReloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	collector := metrics.New([]*backend.Backend{remaining, removed})
+	collector.RecordTunnelOpened(removed)
 	before := collector.PrometheusText()
 	if !strings.Contains(before, `loadbear_backend_requests_total{backend="http://127.0.0.1:8081"}`) {
 		t.Fatalf("initial output missing backend request series:\n%s", before)
@@ -149,8 +178,15 @@ func TestPrometheusOutputTracksBackendReloads(t *testing.T) {
 	collector.SetBackends([]*backend.Backend{remaining})
 	after := collector.PrometheusText()
 	if strings.Contains(after, "127.0.0.1:8081") ||
-		!strings.Contains(after, `loadbear_backend_requests_total{backend="http://127.0.0.1:8082"}`) {
+		!strings.Contains(after, `loadbear_backend_requests_total{backend="http://127.0.0.1:8082"}`) ||
+		strings.Contains(after, "loadbear_tunnel_closed_total{backend=\"http://127.0.0.1:8081\"") {
 		t.Fatalf("output did not reflect backend reload:\n%s", after)
+	}
+	collector.RecordTunnelClosed(removed, "upstream_closed", time.Second)
+	afterClose := collector.PrometheusText()
+	if strings.Contains(afterClose, "127.0.0.1:8081") ||
+		!strings.Contains(afterClose, "loadbear_active_tunnels 0") {
+		t.Fatalf("removed tunnel reappeared after cleanup:\n%s", afterClose)
 	}
 }
 
@@ -188,6 +224,43 @@ func TestPrometheusCircuitStateValues(t *testing.T) {
 	}
 }
 
+func TestPrometheusTunnelMetricsAndReasons(t *testing.T) {
+	b, err := backend.New("http://127.0.0.1:8081", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector := metrics.New([]*backend.Backend{b})
+	reasons := []string{"client_closed", "upstream_closed", "upstream_error", "shutdown_forced", "unknown"}
+	durations := []time.Duration{time.Second, 5 * time.Second, 15 * time.Second, time.Minute, time.Hour}
+	for i, reason := range reasons {
+		collector.RecordTunnelOpened(b)
+		collector.RecordTunnelClosed(b, reason, durations[i])
+	}
+	text := collector.PrometheusText()
+	for _, line := range []string{
+		"loadbear_active_tunnels 0",
+		`loadbear_backend_active_tunnels{backend="http://127.0.0.1:8081"} 0`,
+		`loadbear_tunnel_duration_seconds_bucket{le="1"} 1`,
+		`loadbear_tunnel_duration_seconds_bucket{le="5"} 2`,
+		`loadbear_tunnel_duration_seconds_bucket{le="15"} 3`,
+		`loadbear_tunnel_duration_seconds_bucket{le="60"} 4`,
+		`loadbear_tunnel_duration_seconds_bucket{le="3600"} 5`,
+		"loadbear_tunnel_duration_seconds_bucket{le=\"+Inf\"} 5",
+		"loadbear_tunnel_duration_seconds_sum 3681",
+		"loadbear_tunnel_duration_seconds_count 5",
+		`loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="client_closed"} 1`,
+		`loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="upstream_closed"} 1`,
+		`loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="upstream_error"} 1`,
+		`loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="shutdown_forced"} 1`,
+		`loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="unknown"} 1`,
+	} {
+		if !strings.Contains(text, line) {
+			t.Errorf("Prometheus output missing %q:\n%s", line, text)
+		}
+	}
+	t.Log(text)
+}
+
 func TestConcurrentPrometheusUpdatesAndBackendSwaps(t *testing.T) {
 	first, err := backend.New("http://127.0.0.1:8081", 1)
 	if err != nil {
@@ -211,6 +284,8 @@ func TestConcurrentPrometheusUpdatesAndBackendSwaps(t *testing.T) {
 					target = second
 				}
 				collector.RecordRequest(target, http.StatusOK, time.Millisecond)
+				collector.RecordTunnelOpened(target)
+				collector.RecordTunnelClosed(target, "client_closed", time.Millisecond)
 				if i%10 == 0 {
 					collector.RecordRateLimited()
 				}
@@ -223,7 +298,8 @@ func TestConcurrentPrometheusUpdatesAndBackendSwaps(t *testing.T) {
 	group.Wait()
 	text := collector.PrometheusText()
 	if !strings.Contains(text, fmt.Sprintf("loadbear_requests_total %d", workers*updates)) ||
-		!strings.Contains(text, fmt.Sprintf("loadbear_rate_limited_total %d", workers*((updates+9)/10))) {
+		!strings.Contains(text, fmt.Sprintf("loadbear_rate_limited_total %d", workers*((updates+9)/10))) ||
+		!strings.Contains(text, "loadbear_active_tunnels 0") {
 		t.Fatalf("concurrent metrics totals incorrect:\n%s", text)
 	}
 }

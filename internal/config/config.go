@@ -58,18 +58,19 @@ type HealthConfig struct {
 }
 
 type ProxyConfig struct {
-	MaxIdleConns            int          `yaml:"max_idle_conns"`
-	MaxIdleConnsPerHost     int          `yaml:"max_idle_conns_per_host"`
-	IdleConnTimeout         YAMLDuration `yaml:"idle_conn_timeout"`
-	ResponseHeaderTimeout   YAMLDuration `yaml:"response_header_timeout"`
-	TLSHandshakeTimeout     YAMLDuration `yaml:"tls_handshake_timeout"`
-	DialTimeout             YAMLDuration `yaml:"dial_timeout"`
-	RequestTimeout          YAMLDuration `yaml:"request_timeout"`
-	RetryMaxAttempts        int          `yaml:"retry_max_attempts"`
-	RetryBackoff            YAMLDuration `yaml:"retry_backoff"`
-	CircuitFailureThreshold int          `yaml:"circuit_failure_threshold"`
-	CircuitCooldown         YAMLDuration `yaml:"circuit_cooldown"`
-	CircuitFailureStatuses  []int        `yaml:"circuit_failure_statuses"`
+	MaxIdleConns             int          `yaml:"max_idle_conns"`
+	MaxIdleConnsPerHost      int          `yaml:"max_idle_conns_per_host"`
+	IdleConnTimeout          YAMLDuration `yaml:"idle_conn_timeout"`
+	ResponseHeaderTimeout    YAMLDuration `yaml:"response_header_timeout"`
+	TLSHandshakeTimeout      YAMLDuration `yaml:"tls_handshake_timeout"`
+	DialTimeout              YAMLDuration `yaml:"dial_timeout"`
+	RequestTimeout           YAMLDuration `yaml:"request_timeout"`
+	RetryMaxAttempts         int          `yaml:"retry_max_attempts"`
+	RetryBackoff             YAMLDuration `yaml:"retry_backoff"`
+	CircuitFailureThreshold  int          `yaml:"circuit_failure_threshold"`
+	CircuitCooldown          YAMLDuration `yaml:"circuit_cooldown"`
+	CircuitFailureStatuses   []int        `yaml:"circuit_failure_statuses"`
+	CircuitCountTunnelErrors bool         `yaml:"circuit_count_tunnel_errors"`
 }
 
 type RateLimitConfig struct {

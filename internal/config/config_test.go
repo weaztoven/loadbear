@@ -90,6 +90,20 @@ func TestCircuitFailureStatusesValidation(t *testing.T) {
 	}
 }
 
+func TestTunnelErrorCircuitConfigDefaultsAndNoWindow(t *testing.T) {
+	defaults := DefaultConfig()
+	if defaults.Proxy.CircuitCountTunnelErrors {
+		t.Fatal("tunnel-error circuit counting should be disabled by default")
+	}
+	cfg := validConfig()
+	if err := yaml.Unmarshal([]byte("proxy:\n  circuit_count_tunnel_errors: true\n"), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Proxy.CircuitCountTunnelErrors {
+		t.Fatal("proxy.circuit_count_tunnel_errors was not loaded")
+	}
+}
+
 func TestAdminPprofEnabledMustBeBoolean(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte("backends:\n  - url: http://127.0.0.1:8081\n    weight: 1\nadmin:\n  pprof_enabled: enabled\n")

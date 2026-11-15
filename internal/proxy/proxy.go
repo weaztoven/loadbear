@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -38,10 +39,125 @@ type Handler struct {
 	rateLimiter *ratelimit.RateLimiter
 
 	tunnelMu        sync.Mutex
-	tunnels         map[net.Conn]struct{}
+	tunnels         map[net.Conn]*tunnelLifecycle
 	tunnelClosing   bool
 	tunnelChanged   chan struct{}
 	pendingUpgrades int
+}
+
+type tunnelLifecycle struct {
+	backend *backend.Backend
+	started time.Time
+	mu      sync.Mutex
+	reason  string
+	tracked bool
+}
+
+func (t *tunnelLifecycle) markUpstreamError() {
+	t.markReason(metrics.TunnelReasonUpstreamError)
+}
+
+func (t *tunnelLifecycle) markReason(reason string) {
+	t.mu.Lock()
+	if t.reason == "" {
+		t.reason = reason
+	}
+	t.mu.Unlock()
+}
+
+func (t *tunnelLifecycle) markShutdownForced() {
+	t.mu.Lock()
+	t.reason = metrics.TunnelReasonShutdownForced
+	t.mu.Unlock()
+}
+
+func (t *tunnelLifecycle) closeReason() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.reason == "" {
+		return metrics.TunnelReasonUnknown
+	}
+	return t.reason
+}
+
+type observedTunnelBody struct {
+	io.ReadWriteCloser
+	tunnel *tunnelLifecycle
+}
+
+type observedTunnelCloseWriter struct {
+	*observedTunnelBody
+	closeWriter interface{ CloseWrite() error }
+}
+
+func (b *observedTunnelCloseWriter) CloseWrite() error {
+	return b.closeWriter.CloseWrite()
+}
+
+func observeTunnelBody(body io.ReadWriteCloser, tunnel *tunnelLifecycle) io.ReadWriteCloser {
+	observed := &observedTunnelBody{ReadWriteCloser: body, tunnel: tunnel}
+	if closeWriter, ok := body.(interface{ CloseWrite() error }); ok {
+		return &observedTunnelCloseWriter{observedTunnelBody: observed, closeWriter: closeWriter}
+	}
+	return observed
+}
+
+func (b *observedTunnelBody) Read(p []byte) (int, error) {
+	n, err := b.ReadWriteCloser.Read(p)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		b.tunnel.markReason(metrics.TunnelReasonUpstreamClosed)
+	} else if err != nil {
+		b.tunnel.markUpstreamError()
+	}
+	return n, err
+}
+
+func (b *observedTunnelBody) Write(p []byte) (int, error) {
+	n, err := b.ReadWriteCloser.Write(p)
+	if err != nil {
+		b.tunnel.markUpstreamError()
+	}
+	return n, err
+}
+
+type observedClientConn struct {
+	net.Conn
+	tunnel *tunnelLifecycle
+}
+
+func (c *observedClientConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if errors.Is(err, io.EOF) {
+		c.tunnel.markReason(metrics.TunnelReasonClientClosed)
+	} else if err != nil {
+		c.tunnel.markReason(metrics.TunnelReasonUnknown)
+	}
+	return n, err
+}
+
+func (c *observedClientConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err != nil {
+		c.tunnel.markReason(metrics.TunnelReasonUnknown)
+	}
+	return n, err
+}
+
+type observedClientCloseWriter struct {
+	*observedClientConn
+	closeWriter interface{ CloseWrite() error }
+}
+
+func (c *observedClientCloseWriter) CloseWrite() error {
+	return c.closeWriter.CloseWrite()
+}
+
+func observeClientConn(conn net.Conn, tunnel *tunnelLifecycle) net.Conn {
+	observed := &observedClientConn{Conn: conn, tunnel: tunnel}
+	if closeWriter, ok := conn.(interface{ CloseWrite() error }); ok {
+		return &observedClientCloseWriter{observedClientConn: observed, closeWriter: closeWriter}
+	}
+	return observed
 }
 
 type reverseProxyBufferPool struct {
@@ -82,7 +198,7 @@ func NewHandler(cfg *config.Config, logger *slog.Logger, strategy balancer.Strat
 		bufferPool:    &reverseProxyBufferPool{},
 		metrics:       metricsCollector,
 		rateLimiter:   ratelimit.New(cfg.RateLimit.Rate, cfg.RateLimit.Burst, cfg.RateLimit.Window.Duration()),
-		tunnels:       make(map[net.Conn]struct{}),
+		tunnels:       make(map[net.Conn]*tunnelLifecycle),
 		tunnelChanged: make(chan struct{}, 1),
 	}
 	if cfg.RateLimit.Enabled {
@@ -126,21 +242,39 @@ func (h *Handler) Shutdown(ctx context.Context) int {
 	}
 }
 
-func (h *Handler) trackTunnel(conn net.Conn) bool {
+func (h *Handler) trackTunnel(conn net.Conn, tunnel *tunnelLifecycle) bool {
 	h.tunnelMu.Lock()
 	if h.tunnelClosing {
 		h.tunnelMu.Unlock()
 		_ = conn.Close()
 		return false
 	}
-	h.tunnels[conn] = struct{}{}
+	tunnel.tracked = true
+	h.tunnels[conn] = tunnel
+	if h.metrics != nil {
+		h.metrics.RecordTunnelOpened(tunnel.backend)
+	}
 	h.signalTunnelChangeLocked()
 	h.tunnelMu.Unlock()
 	return true
 }
 
-func (h *Handler) untrackTunnel(conn net.Conn) {
+func (h *Handler) untrackTunnel(conn net.Conn, tunnel *tunnelLifecycle) {
 	h.tunnelMu.Lock()
+	if tunnel.tracked {
+		reason := tunnel.closeReason()
+		duration := time.Since(tunnel.started)
+		if h.metrics != nil {
+			h.metrics.RecordTunnelClosed(tunnel.backend, reason, duration)
+		}
+		if h.config.Proxy.CircuitCountTunnelErrors {
+			if reason == metrics.TunnelReasonUpstreamError {
+				tunnel.backend.RecordTunnelFailure()
+			} else {
+				tunnel.backend.RecordTunnelSuccess()
+			}
+		}
+	}
 	delete(h.tunnels, conn)
 	h.signalTunnelChangeLocked()
 	h.tunnelMu.Unlock()
@@ -170,7 +304,8 @@ func (h *Handler) signalTunnelChangeLocked() {
 func (h *Handler) forceCloseTunnels() int {
 	h.tunnelMu.Lock()
 	connections := make([]net.Conn, 0, len(h.tunnels))
-	for conn := range h.tunnels {
+	for conn, tunnel := range h.tunnels {
+		tunnel.markShutdownForced()
 		connections = append(connections, conn)
 	}
 	h.tunnelMu.Unlock()
@@ -237,7 +372,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w = response
 	defer func() {
 		if conn := response.hijackedConn; conn != nil {
-			h.untrackTunnel(conn)
+			h.untrackTunnel(conn, response.tunnel)
 		}
 	}()
 	requestID := requestIDFromHeader(r)
@@ -383,6 +518,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Header.Set("X-Request-ID", requestID)
 			probeResolved = true
 			current.SetHealthy(true)
+			if resp.StatusCode == http.StatusSwitchingProtocols && isUpgradeRequest(r) {
+				tunnelBody, ok := resp.Body.(io.ReadWriteCloser)
+				if !ok {
+					return errors.New("upgraded backend response body is not read/write/closable")
+				}
+				tunnel := &tunnelLifecycle{backend: current, started: time.Now()}
+				resp.Body = observeTunnelBody(tunnelBody, tunnel)
+				response.tunnel = tunnel
+			}
 			configuredFailure := h.isCircuitFailureStatus(resp.StatusCode)
 			failureStatus := resp.StatusCode >= http.StatusInternalServerError || configuredFailure
 			if failureStatus {
@@ -419,7 +563,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					h.metrics.RecordObservation(resp.StatusCode, time.Since(start), true)
 				}
 			} else {
-				current.RecordSuccess()
+				if resp.StatusCode == http.StatusSwitchingProtocols && isUpgradeRequest(r) &&
+					h.config.Proxy.CircuitCountTunnelErrors {
+					current.RecordHandshakeSuccess()
+				} else {
+					current.RecordSuccess()
+				}
 				if h.metrics != nil {
 					h.metrics.RecordObservation(resp.StatusCode, time.Since(start), false)
 				}
@@ -469,8 +618,9 @@ func (h *Handler) isCircuitFailureStatus(status int) bool {
 type statusWriter struct {
 	http.ResponseWriter
 	status       int
-	trackTunnel  func(net.Conn) bool
+	trackTunnel  func(net.Conn, *tunnelLifecycle) bool
 	hijackedConn net.Conn
+	tunnel       *tunnelLifecycle
 }
 
 func (w *statusWriter) WriteHeader(status int) {
@@ -501,8 +651,11 @@ func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if w.trackTunnel == nil || w.trackTunnel(conn) {
+	if w.trackTunnel == nil || w.trackTunnel(conn, w.tunnel) {
 		w.hijackedConn = conn
+		if w.tunnel != nil {
+			conn = observeClientConn(conn, w.tunnel)
+		}
 	}
 	return conn, rw, nil
 }
