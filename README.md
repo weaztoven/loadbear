@@ -227,10 +227,10 @@ Or use `make cover` for a coverage profile and function summary. CI also runs fo
 
 ## Known limitations and roadmap
 
-- WebSocket upgrades are not verified and should be treated as unsupported; current hop-by-hop header handling removes `Upgrade`.
+- WebSocket-style upgrades are verified only for an HTTP/1.1 upgrade handshake and bidirectional raw-byte echo through the proxy; this does not verify full RFC 6455 protocol behavior.
 - SIGHUP hot reload is not implemented.
 - Metrics are a small hand-written Prometheus text endpoint, not a complete Prometheus client implementation.
-- Load/performance benchmarks and WebSocket integration tests are not currently provided.
+- Load/performance benchmarks are not currently provided.
 
 ## Security notes
 

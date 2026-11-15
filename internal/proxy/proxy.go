@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -172,6 +173,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				req.SetURL(current.URL)
 				req.Out.Host = current.URL.Host
 				stripHopByHopHeaders(req.Out.Header)
+				if isUpgradeRequest(r) {
+					req.Out.Header.Set("Connection", "Upgrade")
+					req.Out.Header.Set("Upgrade", r.Header.Get("Upgrade"))
+				}
 				req.Out.Header.Set("X-Forwarded-For", forwardedFor)
 				req.Out.Header.Set("X-Forwarded-Proto", schemeFromRequest(r))
 				req.Out.Header.Set("X-Forwarded-Host", r.Host)
@@ -182,7 +187,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			current.SetHealthy(false)
 			current.RecordFailure()
 			probeResolved = true
-			if retryableMethod(r.Method) && requestBodyReplayable(r) &&
+			if !isUpgradeRequest(r) && retryableMethod(r.Method) && requestBodyReplayable(r) &&
 				!response.wroteHeader() && attempt < h.config.Proxy.RetryMaxAttempts {
 				next, nextIsProbe := h.selectBackend(selectionRequest)
 				if nextIsProbe && next == current {
@@ -266,6 +271,23 @@ func (w *statusWriter) Write(p []byte) (int, error) {
 
 func (w *statusWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("underlying response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (w *statusWriter) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func (w *statusWriter) statusCode() int {
@@ -436,6 +458,18 @@ func stripHopByHopHeaders(h http.Header) {
 	for _, key := range []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding", "Upgrade"} {
 		h.Del(key)
 	}
+}
+
+func isUpgradeRequest(r *http.Request) bool {
+	if r == nil || r.Header.Get("Upgrade") == "" {
+		return false
+	}
+	for _, token := range strings.Split(r.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+			return true
+		}
+	}
+	return false
 }
 
 func joinURLPath(base, target string) string {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -115,6 +116,132 @@ func TestNoHealthyBackendsReturns503(t *testing.T) {
 	}
 	res := perform(h, http.MethodGet, make(http.Header))
 	assertStatusBody(t, res, http.StatusServiceUnavailable, "no healthy backend available\n")
+}
+
+func TestWebSocketUpgradePassthrough(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Header.Get("Connection"), "Upgrade") ||
+			!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.Error(w, "upgrade headers missing", http.StatusBadRequest)
+			return
+		}
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = fmt.Fprint(rw, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+		if err := rw.Flush(); err != nil {
+			return
+		}
+		_, _ = io.Copy(conn, rw)
+	}))
+	defer backendServer.Close()
+
+	h, backends := testHandler(t, testConfig(), backendServer)
+	proxyServer := httptest.NewServer(h)
+	defer proxyServer.Close()
+	proxyAddress := strings.TrimPrefix(proxyServer.URL, "http://")
+	conn, err := net.DialTimeout("tcp", proxyAddress, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "GET /socket HTTP/1.1\r\nHost: proxy.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	request, _ := http.NewRequest(http.MethodGet, "http://proxy.test/socket", nil)
+	response, err := http.ReadResponse(reader, request)
+	if err != nil {
+		t.Fatalf("read upgrade response: %v", err)
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d, want 101", response.StatusCode)
+	}
+	if _, err := io.WriteString(conn, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, len("hello"))
+	if _, err := io.ReadFull(reader, echo); err != nil {
+		t.Fatalf("read echoed bytes: %v", err)
+	}
+	if string(echo) != "hello" {
+		t.Fatalf("echo = %q, want %q", echo, "hello")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for backends[0].ActiveConnections.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := backends[0].ActiveConnections.Load(); got != 0 {
+		t.Fatalf("active connections after upgrade close = %d, want 0", got)
+	}
+}
+
+func TestNormalRequestsStripHopByHopHeaders(t *testing.T) {
+	received := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	h, _ := testHandler(t, testConfig(), server)
+	headers := make(http.Header)
+	headers.Set("Connection", "keep-alive")
+	headers.Set("Keep-Alive", "timeout=5")
+	headers.Set("Upgrade", "websocket")
+	headers.Set("Proxy-Authorization", "secret")
+	res := perform(h, http.MethodGet, headers)
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", res.Code)
+	}
+	got := <-received
+	for _, name := range []string{"Connection", "Keep-Alive", "Upgrade", "Proxy-Authorization"} {
+		if value := got.Get(name); value != "" {
+			t.Errorf("hop-by-hop header %s was forwarded as %q", name, value)
+		}
+	}
+}
+
+func TestUpgradeRequestsAreNotRetried(t *testing.T) {
+	var fallbackHits atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+	defer fallback.Close()
+	closeBeforeHeaders := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer closeBeforeHeaders.Close()
+	h, _ := testHandler(t, testConfig(), fallback, closeBeforeHeaders)
+	proxyServer := httptest.NewServer(h)
+	defer proxyServer.Close()
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(proxyServer.URL, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprint(conn, "GET /socket HTTP/1.1\r\nHost: proxy.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("upgrade failure status = %d, want 502", response.StatusCode)
+	}
+	if got := fallbackHits.Load(); got != 0 {
+		t.Fatalf("upgrade request retried to fallback %d times", got)
+	}
 }
 
 func TestFailoverAndRecovery(t *testing.T) {
