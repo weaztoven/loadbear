@@ -39,6 +39,99 @@ jobs:
           version: v1.64.8
           args: --config=.golangci.yml
 
+  benchmark-smoke:
+    name: Benchmark smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Build benchmark tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/loadbear-bench-smoke"
+          go build -o "$RUNNER_TEMP/loadbear-bench-smoke/loadbear" ./cmd/loadbear
+          go build -o "$RUNNER_TEMP/loadbear-bench-smoke/fakebackend" ./cmd/fakebackend
+          go build -o "$RUNNER_TEMP/loadbear-bench-smoke/loadgen" ./cmd/loadgen
+      - name: Run short proxy benchmark smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          pids=()
+          cleanup() {
+            for pid in "${pids[@]}"; do
+              kill "$pid" >/dev/null 2>&1 || true
+            done
+            for pid in "${pids[@]}"; do
+              wait "$pid" >/dev/null 2>&1 || true
+            done
+            rm -rf "$tmp"
+          }
+          trap cleanup EXIT
+
+          loadbear="$RUNNER_TEMP/loadbear-bench-smoke/loadbear"
+          fakebackend="$RUNNER_TEMP/loadbear-bench-smoke/fakebackend"
+          loadgen="$RUNNER_TEMP/loadbear-bench-smoke/loadgen"
+          backend_port="$("$loadgen" --free-port)"
+          proxy_port="$("$loadgen" --free-port)"
+          admin_port="$("$loadgen" --free-port)"
+
+          "$fakebackend" --port "$backend_port" --name ci-smoke >"$tmp/fakebackend.log" 2>&1 &
+          pids+=("$!")
+          backend_ready=false
+          for attempt in $(seq 1 60); do
+            if curl --silent --show-error --fail "http://127.0.0.1:$backend_port/health" >/dev/null; then
+              backend_ready=true
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$backend_ready" != true ]; then
+            echo "fakebackend did not become ready" >&2
+            cat "$tmp/fakebackend.log" >&2
+            exit 1
+          fi
+          cat >"$tmp/config.yaml" <<EOF
+          listen: "127.0.0.1:$proxy_port"
+          admin_listen: "127.0.0.1:$admin_port"
+          log_level: "error"
+          backends:
+            - url: "http://127.0.0.1:$backend_port"
+              weight: 1
+          rate_limit:
+            enabled: false
+          health:
+            interval: "1h"
+          EOF
+          "$loadbear" --config "$tmp/config.yaml" >"$tmp/loadbear.log" 2>&1 &
+          pids+=("$!")
+
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl --silent --show-error --fail "http://127.0.0.1:$admin_port/status" >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" != true ]; then
+            echo "loadbear admin listener did not become ready" >&2
+            cat "$tmp/loadbear.log" >&2
+            exit 1
+          fi
+
+          summary="$("$loadgen" --url "http://127.0.0.1:$proxy_port/" --duration 1s --warmup 0s --concurrency 4 --format json)"
+          printf '%s\n' "$summary"
+          requests="$(printf '%s\n' "$summary" | awk -F ': ' '/"total_requests"/ {gsub(/,/, "", $2); print $2}')"
+          errors="$(printf '%s\n' "$summary" | awk -F ': ' '/"errors"/ {gsub(/,/, "", $2); print $2}')"
+          non2xx="$(printf '%s\n' "$summary" | awk -F ': ' '/"non_2xx"/ {gsub(/,/, "", $2); print $2}')"
+          if [ -z "$requests" ] || [ "$requests" -le 0 ] || [ "$errors" != 0 ] || [ "$non2xx" != 0 ]; then
+            echo "benchmark smoke output failed sanity checks" >&2
+            exit 1
+          fi
+
   docker:
     runs-on: ubuntu-latest
     steps:
