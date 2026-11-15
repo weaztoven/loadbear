@@ -21,6 +21,7 @@ loadbear is a small, dependency-light HTTP reverse proxy that distributes reques
 - Per-client-IP token-bucket rate limiting with periodic eviction of idle client buckets.
 - Structured access logs with request ID, client, backend, response status, and latency.
 - YAML configuration; `LOADBEAR_LISTEN` and `LOADBEAR_LOG_LEVEL` override their YAML values.
+- On Linux and macOS, SIGHUP reloads the backend list and selection strategy without interrupting in-flight requests.
 - Separate admin listener with `/status` and `/metrics`.
 - Graceful server shutdown on SIGINT and SIGTERM.
 - Multi-stage Docker images and a Docker Compose demo.
@@ -131,6 +132,24 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 
 See [examples/config.example.yaml](examples/config.example.yaml) and [examples/config.docker.yaml](examples/config.docker.yaml).
 
+## Reloading configuration
+
+On Linux and macOS, send SIGHUP to reload and validate the config file used at startup:
+
+```sh
+kill -HUP <pid>
+```
+
+In Docker, signal the running container:
+
+```sh
+docker kill --signal=HUP <container>
+```
+
+Only the backend list (URLs and weights) and selection strategy are reloaded. Backends with unchanged URLs keep their health, counters, and circuit-breaker state. In-flight requests to removed backends are allowed to finish. Invalid configuration is rejected and the old backend set remains active; bursts of SIGHUP are coalesced.
+
+All other settings are startup-only and require a restart, including proxy/admin listen addresses, timeouts and retry/circuit-breaker settings, health-check settings, rate limiting, and logging. SIGHUP reload is not available on Windows.
+
 ## Algorithm comparison
 
 | Strategy | Selection behavior | Uses weights | Client affinity |
@@ -228,7 +247,7 @@ Or use `make cover` for a coverage profile and function summary. CI also runs fo
 ## Known limitations and roadmap
 
 - WebSocket-style upgrades are verified only for an HTTP/1.1 upgrade handshake and bidirectional raw-byte echo through the proxy; this does not verify full RFC 6455 protocol behavior.
-- SIGHUP hot reload is not implemented.
+- SIGHUP configuration reload is unavailable on Windows.
 - Metrics are a small hand-written Prometheus text endpoint, not a complete Prometheus client implementation.
 - Load/performance benchmarks are not currently provided.
 

@@ -77,18 +77,34 @@ func (h *Handler) StopBackground() {
 func (h *Handler) SetBackends(backends []*backend.Backend) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.backends = backends
+	h.backends = append([]*backend.Backend(nil), backends...)
 	if h.metrics != nil {
-		h.metrics.Backends = backends
+		h.metrics.SetBackends(backends)
+	}
+}
+
+func (h *Handler) ReplaceBackendSet(backends []*backend.Backend, strategy balancer.Strategy, weights map[*backend.Backend]int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for b, weight := range weights {
+		b.SetWeight(weight)
+	}
+	h.backends = append([]*backend.Backend(nil), backends...)
+	h.strategy = strategy
+	for _, b := range h.backends {
+		if b != nil {
+			b.CurrentWeight.Store(0)
+		}
+	}
+	if h.metrics != nil {
+		h.metrics.SetBackends(backends)
 	}
 }
 
 func (h *Handler) currentBackends() []*backend.Backend {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	out := make([]*backend.Backend, len(h.backends))
-	copy(out, h.backends)
-	return out
+	return append([]*backend.Backend(nil), h.backends...)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -242,11 +258,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) selectBackend(req *http.Request) (*backend.Backend, bool) {
-	backends := h.currentBackends()
-	if strategy, ok := h.strategy.(balancer.ProbeStrategy); ok {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	backends := h.backends
+	strategy := h.strategy
+	if strategy, ok := strategy.(balancer.ProbeStrategy); ok {
 		return strategy.SelectWithProbe(backends, req)
 	}
-	return h.strategy.Select(backends, req), false
+	return strategy.Select(backends, req), false
 }
 
 type statusWriter struct {
@@ -361,8 +380,9 @@ func retryableMethod(method string) bool {
 }
 
 func (h *Handler) Status() []map[string]any {
-	items := make([]map[string]any, 0, len(h.currentBackends()))
-	for _, b := range h.currentBackends() {
+	backends := h.currentBackends()
+	items := make([]map[string]any, 0, len(backends))
+	for _, b := range backends {
 		if b == nil {
 			continue
 		}
@@ -527,6 +547,8 @@ func (h *Handler) Config() *config.Config {
 }
 
 func (h *Handler) StrategyName() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	if h.strategy == nil {
 		return ""
 	}
@@ -534,6 +556,8 @@ func (h *Handler) StrategyName() string {
 }
 
 func (h *Handler) SetStrategy(s balancer.Strategy) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.strategy = s
 }
 

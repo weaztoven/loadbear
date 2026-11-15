@@ -72,6 +72,18 @@ func (b *Backend) SetHealthy(healthy bool) {
 	b.Healthy = healthy
 }
 
+func (b *Backend) SetWeight(weight int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.Weight = weight
+}
+
+func (b *Backend) GetWeight() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.Weight
+}
+
 func (b *Backend) IncrementActive() {
 	b.ActiveConnections.Add(1)
 }
@@ -187,6 +199,6 @@ func (b *Backend) Export() map[string]any {
 		"total_requests":     b.TotalRequests.Load(),
 		"total_failures":     b.TotalFailures.Load(),
 		"circuit_state":      string(b.GetCircuitState()),
-		"weight":             b.Weight,
+		"weight":             b.GetWeight(),
 	}
 }

@@ -65,8 +65,9 @@ func (s *SmoothWeightedRoundRobin) SelectWithProbe(backends []*backend.Backend, 
 		best := candidates[0]
 		bestScore := int64(-1 << 62)
 		for _, b := range candidates {
-			current := b.CurrentWeight.Add(int64(b.Weight))
-			total += int64(b.Weight)
+			weight := b.GetWeight()
+			current := b.CurrentWeight.Add(int64(weight))
+			total += int64(weight)
 			if current > bestScore {
 				bestScore = current
 				best = b

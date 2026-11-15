@@ -94,8 +94,11 @@ func main() {
 	}
 	healthChecker := health.New(backends, cfg.Health.Path, cfg.Health.Interval.Duration(), cfg.Health.Timeout.Duration(), cfg.Health.HealthyThreshold, cfg.Health.UnhealthyThreshold, logger)
 	healthChecker.Start()
-	shutdownCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	shutdownCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+	reloadSignals, stopReloadSignal := registerReloadSignal()
+	defer stopReloadSignal()
+	reloader := newReloadManager(configPath, cfg, handler, healthChecker, logger)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -111,70 +114,31 @@ func main() {
 		}
 	}()
 	logger.Info("loadbear started", "listen", cfg.Listen, "admin_listen", cfg.AdminListen, "strategy", cfg.Strategy)
-	go func() {
-		for {
-			select {
-			case <-shutdownCtx.Done():
-				logger.Info("shutdown initiated")
-				shutdownServer(proxyServer, adminServer, cfg.Shutdown.GracePeriod.Duration())
-				return
-			default:
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-	}()
 	for {
 		select {
 		case <-shutdownCtx.Done():
+			logger.Info("shutdown initiated")
+			shutdownServer(proxyServer, adminServer, cfg.Shutdown.GracePeriod.Duration())
 			logger.Info("goodbye")
 			healthChecker.Stop()
 			handler.StopBackground()
+			wg.Wait()
 			return
-		case <-time.After(200 * time.Millisecond):
-			if signalChannel := signalCh(); signalChannel != nil {
-				select {
-				case sig := <-signalChannel:
-					if sig == syscall.SIGHUP {
-						configReload(cfg, logger, handler)
-					}
-				default:
-				}
-			}
+		case <-reloadSignals:
+			drainReloadSignals(reloadSignals)
+			_ = reloader.ReloadFromFile()
 		}
 	}
 }
 
-func signalCh() chan os.Signal {
-	return make(chan os.Signal, 1)
-}
-
-func configReload(cfg *config.Config, logger *slog.Logger, handler *proxy.Handler) {
-	updated, err := config.Load("")
-	if err != nil {
-		logger.Error("reload failed", "error", err)
-		return
-	}
-	newBackends := make([]*backend.Backend, 0, len(updated.Backends))
-	for _, item := range updated.Backends {
-		parsed, err := backend.New(item.URL, item.Weight)
-		if err != nil {
-			logger.Error("reload backend invalid", "url", item.URL, "error", err)
-			continue
+func drainReloadSignals(signals <-chan os.Signal) {
+	for signals != nil {
+		select {
+		case <-signals:
+		default:
+			return
 		}
-		parsed.CircuitFailureThreshold = updated.Proxy.CircuitFailureThreshold
-		parsed.CircuitCooldown = updated.Proxy.CircuitCooldown.Duration()
-		newBackends = append(newBackends, parsed)
 	}
-	if len(newBackends) == 0 {
-		logger.Warn("reload skipped: no valid backends")
-		return
-	}
-	cfg.Listen = updated.Listen
-	cfg.LogLevel = updated.LogLevel
-	cfg.Strategy = updated.Strategy
-	cfg.Backends = updated.Backends
-	handler.SetBackends(newBackends)
-	logger.Info("reloaded config", "backend_count", len(newBackends))
 }
 
 func shutdownServer(proxyServer *http.Server, adminServer *http.Server, grace time.Duration) {

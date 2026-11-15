@@ -30,10 +30,16 @@ type Metrics struct {
 
 func New(backends []*backend.Backend) *Metrics {
 	return &Metrics{
-		Backends:       backends,
+		Backends:       append([]*backend.Backend(nil), backends...),
 		latencyBuckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		histogram:      make(map[string]uint64),
 	}
+}
+
+func (m *Metrics) SetBackends(backends []*backend.Backend) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Backends = append([]*backend.Backend(nil), backends...)
 }
 
 func (m *Metrics) RecordRequest(b *backend.Backend, status int, latency time.Duration) {

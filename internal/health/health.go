@@ -12,7 +12,6 @@ import (
 )
 
 type Checker struct {
-	Backends           []*backend.Backend
 	Path               string
 	Interval           time.Duration
 	Timeout            time.Duration
@@ -23,6 +22,8 @@ type Checker struct {
 	cancel             context.CancelFunc
 	startOnce          sync.Once
 	done               chan struct{}
+	mu                 sync.RWMutex
+	backends           []*backend.Backend
 	stateMu            sync.Mutex
 	states             map[*backend.Backend]checkState
 }
@@ -35,7 +36,6 @@ type checkState struct {
 func New(backends []*backend.Backend, path string, interval, timeout time.Duration, healthyThreshold, unhealthyThreshold int, logger *slog.Logger) *Checker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Checker{
-		Backends:           backends,
 		Path:               path,
 		Interval:           interval,
 		Timeout:            timeout,
@@ -45,8 +45,32 @@ func New(backends []*backend.Backend, path string, interval, timeout time.Durati
 		ctx:                ctx,
 		cancel:             cancel,
 		done:               make(chan struct{}),
+		backends:           append([]*backend.Backend(nil), backends...),
 		states:             make(map[*backend.Backend]checkState),
 	}
+}
+
+func (c *Checker) SetBackends(backends []*backend.Backend) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.backends = append([]*backend.Backend(nil), backends...)
+	current := make(map[*backend.Backend]struct{}, len(c.backends))
+	for _, b := range c.backends {
+		current[b] = struct{}{}
+	}
+	for b := range c.states {
+		if _, ok := current[b]; !ok {
+			delete(c.states, b)
+		}
+	}
+}
+
+func (c *Checker) backendSnapshot() []*backend.Backend {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]*backend.Backend(nil), c.backends...)
 }
 
 func (c *Checker) Start() {
@@ -64,7 +88,7 @@ func (c *Checker) Start() {
 				case <-c.ctx.Done():
 					return
 				case <-ticker.C:
-					for _, b := range c.Backends {
+					for _, b := range c.backendSnapshot() {
 						c.check(b)
 					}
 				}
@@ -103,7 +127,20 @@ func (c *Checker) check(b *backend.Backend) bool {
 }
 
 func (c *Checker) recordResult(b *backend.Backend, healthy bool, status int, err error) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	found := false
+	for _, current := range c.backends {
+		if current == b {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return healthy
+	}
 	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	state := c.states[b]
 	wasHealthy := b.IsHealthy()
 	if healthy {
@@ -132,6 +169,5 @@ func (c *Checker) recordResult(b *backend.Backend, healthy bool, status int, err
 		}
 	}
 	c.states[b] = state
-	c.stateMu.Unlock()
 	return healthy
 }

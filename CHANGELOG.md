@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Integration coverage for HTTP/1.1 WebSocket-style upgrade handshakes and bidirectional byte echo through the proxy.
+- Linux/macOS SIGHUP reload for backend URLs, weights, and selection strategy, preserving unchanged backend state and in-flight requests.
 
 ## [0.1.1] - 2026-11-13
 
