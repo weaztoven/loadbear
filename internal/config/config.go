@@ -84,9 +84,14 @@ type ShutdownConfig struct {
 	GracePeriod YAMLDuration `yaml:"grace_period"`
 }
 
+type AdminConfig struct {
+	PprofEnabled bool `yaml:"pprof_enabled"`
+}
+
 type Config struct {
 	Listen      string          `yaml:"listen"`
 	AdminListen string          `yaml:"admin_listen"`
+	Admin       AdminConfig     `yaml:"admin"`
 	LogLevel    string          `yaml:"log_level"`
 	LogFormat   string          `yaml:"log_format"`
 	Strategy    string          `yaml:"strategy"`

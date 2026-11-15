@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -66,9 +67,7 @@ func main() {
 	metricsCollector := metrics.New(backends)
 	handler := proxy.NewHandler(cfg, logger, strategy, backends, metricsCollector)
 	defer handler.StopBackground()
-	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("/status", handler.StatusEndpoint)
-	adminMux.HandleFunc("/metrics", handler.MetricsEndpoint)
+	adminMux := newAdminMux(cfg, handler)
 	proxyMux := http.NewServeMux()
 	proxyMux.Handle("/", recoverMiddleware(handler))
 	proxyServer := &http.Server{
@@ -120,7 +119,7 @@ func main() {
 			logger.Info("shutdown initiated")
 			shutdownServer(proxyServer, adminServer, handler, cfg.Shutdown.GracePeriod.Duration())
 			logger.Info("goodbye")
-			healthChecker.Stop()
+			reloader.StopHealthChecker()
 			handler.StopBackground()
 			wg.Wait()
 			return
@@ -129,6 +128,23 @@ func main() {
 			_ = reloader.ReloadFromFile()
 		}
 	}
+}
+
+func newAdminMux(cfg *config.Config, handler *proxy.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", handler.StatusEndpoint)
+	mux.HandleFunc("/metrics", handler.MetricsEndpoint)
+	if cfg.Admin.PprofEnabled {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		for _, name := range []string{"allocs", "block", "goroutine", "heap", "mutex", "threadcreate"} {
+			mux.Handle("/debug/pprof/"+name, pprof.Handler(name))
+		}
+	}
+	return mux
 }
 
 func drainReloadSignals(signals <-chan os.Signal) {

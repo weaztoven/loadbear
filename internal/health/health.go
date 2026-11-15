@@ -89,6 +89,9 @@ func (c *Checker) Start() {
 					return
 				case <-ticker.C:
 					for _, b := range c.backendSnapshot() {
+						if c.ctx.Err() != nil {
+							return
+						}
 						c.check(b)
 					}
 				}
@@ -106,7 +109,7 @@ func (c *Checker) Stop() {
 }
 
 func (c *Checker) check(b *backend.Backend) bool {
-	if b == nil {
+	if b == nil || c.ctx.Err() != nil {
 		return false
 	}
 	client := &http.Client{Timeout: c.Timeout}
@@ -120,6 +123,9 @@ func (c *Checker) check(b *backend.Backend) bool {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if c.ctx.Err() != nil {
+			return false
+		}
 		return c.recordResult(b, false, 0, err)
 	}
 	defer resp.Body.Close()

@@ -33,6 +33,7 @@ type Handler struct {
 	backends    []*backend.Backend
 	strategy    balancer.Strategy
 	transport   *http.Transport
+	bufferPool  *reverseProxyBufferPool
 	metrics     *metrics.Metrics
 	rateLimiter *ratelimit.RateLimiter
 
@@ -41,6 +42,21 @@ type Handler struct {
 	tunnelClosing   bool
 	tunnelChanged   chan struct{}
 	pendingUpgrades int
+}
+
+type reverseProxyBufferPool struct {
+	pool sync.Pool
+}
+
+func (p *reverseProxyBufferPool) Get() []byte {
+	if v := p.pool.Get(); v != nil {
+		return *(v.(*[]byte))
+	}
+	return make([]byte, 32*1024)
+}
+
+func (p *reverseProxyBufferPool) Put(buffer []byte) {
+	p.pool.Put(&buffer)
 }
 
 func NewHandler(cfg *config.Config, logger *slog.Logger, strategy balancer.Strategy, backends []*backend.Backend, metricsCollector *metrics.Metrics) *Handler {
@@ -63,6 +79,7 @@ func NewHandler(cfg *config.Config, logger *slog.Logger, strategy balancer.Strat
 		backends:      backends,
 		strategy:      strategy,
 		transport:     transport,
+		bufferPool:    &reverseProxyBufferPool{},
 		metrics:       metricsCollector,
 		rateLimiter:   ratelimit.New(cfg.RateLimit.Rate, cfg.RateLimit.Burst, cfg.RateLimit.Window.Duration()),
 		tunnels:       make(map[net.Conn]struct{}),
@@ -300,7 +317,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			current.DecrementActive()
 		}()
 		reverseProxy := &httputil.ReverseProxy{
-			Transport: h.transport,
+			Transport:  h.transport,
+			BufferPool: h.bufferPool,
 			Rewrite: func(req *httputil.ProxyRequest) {
 				req.SetURL(current.URL)
 				req.Out.Host = current.URL.Host
@@ -368,9 +386,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			configuredFailure := h.isCircuitFailureStatus(resp.StatusCode)
 			failureStatus := resp.StatusCode >= http.StatusInternalServerError || configuredFailure
 			if failureStatus {
-				if !configuredFailure {
-					current.RecordSuccess()
-				}
 				if configuredFailure && !isUpgradeRequest(r) && retryableMethod(r.Method) &&
 					requestBodyReplayable(r) && !response.wroteHeader() &&
 					attempt < h.config.Proxy.RetryMaxAttempts {
