@@ -7,10 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.2.1] - 2026-11-15
+
 ### Added
 
 - Standard-library `cmd/loadgen` with bounded latency sampling and JSON/Markdown summaries.
 - Reproducible Linux/macOS and Windows benchmark scripts for direct-backend and proxy strategy scenarios.
+- `proxy.circuit_failure_statuses` to configure additional breaker failure statuses, with retries only for eligible requests before response commitment.
+- Graceful tracking and force-close of upgraded tunnels when shutdown grace expires.
+- Cumulative Prometheus latency buckets with `_sum`/`_count`, per-backend request/failure and circuit metrics, and a rate-limited counter.
+
+### Changed
+
+- Prometheus backend labels now use escaped `backend` values and stable backend ordering.
+- Backend request counters include each upstream attempt; terminal transport errors no longer double-count backend failures.
 
 ## [0.2.0] - 2026-11-15
 

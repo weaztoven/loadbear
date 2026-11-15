@@ -69,6 +69,7 @@ type ProxyConfig struct {
 	RetryBackoff            YAMLDuration `yaml:"retry_backoff"`
 	CircuitFailureThreshold int          `yaml:"circuit_failure_threshold"`
 	CircuitCooldown         YAMLDuration `yaml:"circuit_cooldown"`
+	CircuitFailureStatuses  []int        `yaml:"circuit_failure_statuses"`
 }
 
 type RateLimitConfig struct {
@@ -206,6 +207,17 @@ func (c *Config) Validate() error {
 		if backend.Weight <= 0 {
 			return fmt.Errorf("backends[%d].weight must be positive", i)
 		}
+	}
+	seenFailureStatuses := make(map[int]struct{}, len(c.Proxy.CircuitFailureStatuses))
+	for i, status := range c.Proxy.CircuitFailureStatuses {
+		field := fmt.Sprintf("proxy.circuit_failure_statuses[%d]", i)
+		if status < 100 || status > 599 {
+			return fmt.Errorf("%s must be between 100 and 599", field)
+		}
+		if _, ok := seenFailureStatuses[status]; ok {
+			return fmt.Errorf("%s is duplicated: %d", field, status)
+		}
+		seenFailureStatuses[status] = struct{}{}
 	}
 	if c.Health.Interval.Duration() <= 0 {
 		return errors.New("health.interval must be positive")

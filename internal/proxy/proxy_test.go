@@ -14,6 +14,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -54,6 +57,36 @@ func testConfig() *config.Config {
 	cfg.RateLimit.Enabled = false
 	cfg.Proxy.RetryMaxAttempts = 3
 	return &cfg
+}
+
+func configWithCircuitFailureStatuses(t *testing.T, statusCodes []int, urls ...string) *config.Config {
+	t.Helper()
+	var data strings.Builder
+	data.WriteString("strategy: round_robin\nbackends:\n")
+	for _, backendURL := range urls {
+		fmt.Fprintf(&data, "  - url: %q\n    weight: 1\n", backendURL)
+	}
+	data.WriteString("proxy:\n  circuit_failure_threshold: 2\n")
+	if len(statusCodes) > 0 {
+		data.WriteString("  circuit_failure_statuses: [")
+		for i, status := range statusCodes {
+			if i > 0 {
+				data.WriteString(", ")
+			}
+			data.WriteString(strconv.Itoa(status))
+		}
+		data.WriteString("]\n")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(data.String()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RateLimit.Enabled = false
+	return cfg
 }
 
 func perform(h http.Handler, method string, headers http.Header) *httptest.ResponseRecorder {
@@ -311,6 +344,137 @@ func TestRetryOnlyForIdempotentMethods(t *testing.T) {
 				t.Fatalf("%s fallback hits = %d; want 1", method, got)
 			}
 		})
+	}
+}
+
+func TestDefaultCircuitFailureStatusesDoNotTreat429AsBreakerFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	h, backends := testHandler(t, testConfig(), server)
+	for range 2 {
+		if got := perform(h, http.MethodGet, make(http.Header)).Code; got != http.StatusTooManyRequests {
+			t.Fatalf("response status = %d, want 429", got)
+		}
+	}
+	if backends[0].GetCircuitState() != backend.CircuitClosed || backends[0].TotalFailures.Load() != 0 {
+		t.Fatalf("default 429 behavior changed: state=%s failures=%d",
+			backends[0].GetCircuitState(), backends[0].TotalFailures.Load())
+	}
+}
+
+func TestConfiguredCircuitFailureStatusesOpenAndRecover(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusTooManyRequests)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer server.Close()
+	cfg := configWithCircuitFailureStatuses(t, []int{http.StatusTooManyRequests}, server.URL)
+	cfg.Proxy.CircuitCooldown = config.YAMLDuration(time.Hour)
+	h, backends := testHandler(t, cfg, server)
+	b := backends[0]
+	b.CircuitFailureThreshold = cfg.Proxy.CircuitFailureThreshold
+	b.CircuitCooldown = cfg.Proxy.CircuitCooldown.Duration()
+	for i := 0; i < 2; i++ {
+		if got := perform(h, http.MethodGet, make(http.Header)).Code; got != http.StatusTooManyRequests {
+			t.Fatalf("configured failure status = %d, want 429", got)
+		}
+	}
+	if got := b.GetCircuitState(); got != backend.CircuitOpen {
+		t.Fatalf("circuit state after configured failures = %q, want open", got)
+	}
+	if got := b.TotalFailures.Load(); got != 2 {
+		t.Fatalf("failure count = %d, want 2", got)
+	}
+	status.Store(http.StatusOK)
+	b.CircuitOpenedAt = time.Now().Add(-2 * time.Hour)
+	if got := perform(h, http.MethodGet, make(http.Header)).Code; got != http.StatusOK {
+		t.Fatalf("recovery response status = %d, want 200", got)
+	}
+	if got := b.GetCircuitState(); got != backend.CircuitClosed {
+		t.Fatalf("circuit state after recovery = %q, want closed", got)
+	}
+}
+
+func TestConfiguredCircuitFailureStatusRetriesOnlyEligibleRequests(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		method     string
+		wantStatus int
+		wantRetry  bool
+	}{
+		{name: "GET retries", method: http.MethodGet, wantStatus: http.StatusAccepted, wantRetry: true},
+		{name: "POST does not retry", method: http.MethodPost, wantStatus: http.StatusTooManyRequests},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var fallbackHits atomic.Int32
+			failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, "busy")
+			}))
+			defer failing.Close()
+			fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fallbackHits.Add(1)
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer fallback.Close()
+			cfg := configWithCircuitFailureStatuses(t, []int{http.StatusTooManyRequests}, fallback.URL, failing.URL)
+			cfg.Proxy.RetryMaxAttempts = 2
+			h, backends := testHandler(t, cfg, fallback, failing)
+			res := perform(h, test.method, make(http.Header))
+			if res.Code != test.wantStatus {
+				t.Fatalf("response = %d %q, want %d", res.Code, res.Body.String(), test.wantStatus)
+			}
+			wantHits := int32(0)
+			if test.wantRetry {
+				wantHits = 1
+			}
+			if got := fallbackHits.Load(); got != wantHits {
+				t.Fatalf("fallback hits = %d, want %d", got, wantHits)
+			}
+			if backends[1].TotalRequests.Load() != 1 || backends[1].TotalFailures.Load() != 1 {
+				t.Fatalf("failed backend counters = requests:%d failures:%d, want 1 each",
+					backends[1].TotalRequests.Load(), backends[1].TotalFailures.Load())
+			}
+			if test.wantRetry && backends[0].TotalRequests.Load() != 1 {
+				t.Fatalf("fallback request count = %d, want 1", backends[0].TotalRequests.Load())
+			}
+		})
+	}
+}
+
+func TestDefaultFiveHundredResponseIsCountedButNotRetried(t *testing.T) {
+	var fallbackHits atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackHits.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer fallback.Close()
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer failing.Close()
+	h, backends := testHandler(t, testConfig(), fallback, failing)
+	res := perform(h, http.MethodGet, make(http.Header))
+	if res.Code != http.StatusInternalServerError || backends[1].TotalFailures.Load() != 1 || fallbackHits.Load() != 0 {
+		t.Fatalf("default 500 behavior: status=%d failures=%d retries=%d",
+			res.Code, backends[1].TotalFailures.Load(), fallbackHits.Load())
+	}
+}
+
+func TestTerminalUpstreamErrorCountsOneBackendFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	serverURL := server.URL
+	server.Close()
+	h, backends := testHandler(t, testConfig(), &httptest.Server{URL: serverURL})
+	res := perform(h, http.MethodPost, make(http.Header))
+	if res.Code != http.StatusBadGateway {
+		t.Fatalf("response status = %d, want 502", res.Code)
+	}
+	if got := backends[0].TotalFailures.Load(); got != 1 {
+		t.Fatalf("backend failure count = %d, want 1", got)
 	}
 }
 
@@ -917,6 +1081,9 @@ func TestRateLimitResponseAndTrustedForwarding(t *testing.T) {
 	res = perform(h, http.MethodGet, headers)
 	if res.Code != http.StatusTooManyRequests || res.Header().Get("Retry-After") != "60" {
 		t.Fatalf("rate-limited response = %d, Retry-After %q", res.Code, res.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(h.metrics.PrometheusText(), "loadbear_rate_limited_total 1") {
+		t.Fatal("rate-limited request was not counted in metrics")
 	}
 
 	cfg = testConfig()

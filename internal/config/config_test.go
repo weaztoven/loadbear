@@ -67,6 +67,29 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+func TestCircuitFailureStatusesValidation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		statuses string
+	}{
+		{name: "below minimum", statuses: "99"},
+		{name: "above maximum", statuses: "600"},
+		{name: "duplicate", statuses: "429, 429"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			data := []byte("backends:\n  - url: http://127.0.0.1:8081\n    weight: 1\nproxy:\n  circuit_failure_statuses: [" + test.statuses + "]\n")
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), "proxy.circuit_failure_statuses") {
+				t.Fatalf("Load error = %v; want proxy.circuit_failure_statuses validation error", err)
+			}
+		})
+	}
+}
+
 func TestLoadDefaultsAndEnvironmentOverrides(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte("backends:\n  - url: http://127.0.0.1:8081\n    weight: 1\nrate_limit:\n  trusted_proxies: [127.0.0.1, 192.0.2.0/24]\n")

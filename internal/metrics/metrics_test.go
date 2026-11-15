@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,14 +44,187 @@ func TestMetricsSnapshotAndPrometheusOutput(t *testing.T) {
 	for _, metric := range []string{
 		"loadbear_requests_total 3",
 		"loadbear_failures_total 2",
-		"loadbear_request_latency_seconds_bucket{le=\"0.010\"} 1",
+		"loadbear_request_latency_seconds_bucket{le=\"0.01\"} 2",
 		"loadbear_request_latency_seconds_bucket{le=\"+Inf\"} 3",
-		"loadbear_backend_up{name=\"127.0.0.1:8081\"} 1",
-		"loadbear_backend_active_connections{name=\"127.0.0.1:8081\"} 1",
+		"loadbear_request_latency_seconds_sum 20.013",
+		"loadbear_request_latency_seconds_count 3",
+		"loadbear_backend_up{backend=\"http://127.0.0.1:8081\"} 1",
+		"loadbear_backend_active_connections{backend=\"http://127.0.0.1:8081\"} 1",
 	} {
 		if !strings.Contains(text, metric) {
 			t.Errorf("Prometheus output missing %q:\n%s", metric, text)
 		}
+	}
+}
+
+func TestPrometheusHistogramIsCumulativeAndIncludesSumAndCount(t *testing.T) {
+	b, err := backend.New("http://127.0.0.1:8081", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.IncrementActive()
+	collector := metrics.New([]*backend.Backend{b})
+	collector.RecordRequest(b, http.StatusOK, 8*time.Millisecond)
+	collector.RecordRequest(b, http.StatusInternalServerError, 20*time.Second)
+	collector.RecordRequest(nil, http.StatusServiceUnavailable, 5*time.Millisecond)
+
+	want := `# HELP loadbear_requests_total Total number of proxied requests.
+# TYPE loadbear_requests_total counter
+loadbear_requests_total 3
+# HELP loadbear_failures_total Total number of failing requests.
+# TYPE loadbear_failures_total counter
+loadbear_failures_total 2
+# HELP loadbear_rate_limited_total Total number of rate-limited requests.
+# TYPE loadbear_rate_limited_total counter
+loadbear_rate_limited_total 0
+# HELP loadbear_request_latency_seconds Request latency in seconds.
+# TYPE loadbear_request_latency_seconds histogram
+loadbear_request_latency_seconds_bucket{le="0.001"} 0
+loadbear_request_latency_seconds_bucket{le="0.0025"} 0
+loadbear_request_latency_seconds_bucket{le="0.005"} 1
+loadbear_request_latency_seconds_bucket{le="0.01"} 2
+loadbear_request_latency_seconds_bucket{le="0.025"} 2
+loadbear_request_latency_seconds_bucket{le="0.05"} 2
+loadbear_request_latency_seconds_bucket{le="0.1"} 2
+loadbear_request_latency_seconds_bucket{le="0.25"} 2
+loadbear_request_latency_seconds_bucket{le="0.5"} 2
+loadbear_request_latency_seconds_bucket{le="1"} 2
+loadbear_request_latency_seconds_bucket{le="2.5"} 2
+loadbear_request_latency_seconds_bucket{le="5"} 2
+loadbear_request_latency_seconds_bucket{le="10"} 2
+loadbear_request_latency_seconds_bucket{le="+Inf"} 3
+loadbear_request_latency_seconds_sum 20.013
+loadbear_request_latency_seconds_count 3
+# HELP loadbear_backend_up Backend health gauge.
+# TYPE loadbear_backend_up gauge
+loadbear_backend_up{backend="http://127.0.0.1:8081"} 1
+# HELP loadbear_backend_requests_total Total requests sent to each backend.
+# TYPE loadbear_backend_requests_total counter
+loadbear_backend_requests_total{backend="http://127.0.0.1:8081"} 2
+# HELP loadbear_backend_failures_total Total failed requests for each backend.
+# TYPE loadbear_backend_failures_total counter
+loadbear_backend_failures_total{backend="http://127.0.0.1:8081"} 1
+# HELP loadbear_backend_active_connections Active backend connections.
+# TYPE loadbear_backend_active_connections gauge
+loadbear_backend_active_connections{backend="http://127.0.0.1:8081"} 1
+# HELP loadbear_circuit_state Backend circuit state (0 closed, 1 open, 2 half-open).
+# TYPE loadbear_circuit_state gauge
+loadbear_circuit_state{backend="http://127.0.0.1:8081"} 0
+`
+	if got := collector.PrometheusText(); got != want {
+		t.Fatalf("Prometheus output mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func TestPrometheusLabelsUseFullBackendURL(t *testing.T) {
+	b, err := backend.New("http://127.0.0.1:8081", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.URL.Path = "/api"
+	text := metrics.New([]*backend.Backend{b}).PrometheusText()
+	if !strings.Contains(text, `loadbear_backend_up{backend="http://127.0.0.1:8081/api"} 1`) {
+		t.Fatalf("backend label does not identify the full URL:\n%s", text)
+	}
+}
+
+func TestPrometheusOutputTracksBackendReloads(t *testing.T) {
+	removed, err := backend.New("http://127.0.0.1:8081", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := backend.New("http://127.0.0.1:8082", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector := metrics.New([]*backend.Backend{remaining, removed})
+	before := collector.PrometheusText()
+	if !strings.Contains(before, `loadbear_backend_requests_total{backend="http://127.0.0.1:8081"}`) {
+		t.Fatalf("initial output missing backend request series:\n%s", before)
+	}
+	if strings.Index(before, "backend=\"http://127.0.0.1:8081\"") >
+		strings.Index(before, "backend=\"http://127.0.0.1:8082\"") {
+		t.Fatalf("backend metrics are not sorted:\n%s", before)
+	}
+	collector.SetBackends([]*backend.Backend{remaining})
+	after := collector.PrometheusText()
+	if strings.Contains(after, "127.0.0.1:8081") ||
+		!strings.Contains(after, `loadbear_backend_requests_total{backend="http://127.0.0.1:8082"}`) {
+		t.Fatalf("output did not reflect backend reload:\n%s", after)
+	}
+}
+
+func TestPrometheusCircuitStateValues(t *testing.T) {
+	closed, err := backend.New("http://127.0.0.1:8081", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := backend.New("http://127.0.0.1:8082", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open.CircuitFailureThreshold = 1
+	open.RecordFailure()
+	halfOpen, err := backend.New("http://127.0.0.1:8083", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	halfOpen.CircuitState = backend.CircuitOpen
+	halfOpen.CircuitOpenedAt = time.Now().Add(-time.Hour)
+	halfOpen.CircuitCooldown = time.Minute
+	if allowed, probe := halfOpen.AllowRequestWithProbe(); !allowed || !probe {
+		t.Fatal("expected expired open circuit to admit its half-open probe")
+	}
+
+	text := metrics.New([]*backend.Backend{closed, open, halfOpen}).PrometheusText()
+	for _, line := range []string{
+		`loadbear_circuit_state{backend="http://127.0.0.1:8081"} 0`,
+		`loadbear_circuit_state{backend="http://127.0.0.1:8082"} 1`,
+		`loadbear_circuit_state{backend="http://127.0.0.1:8083"} 2`,
+	} {
+		if !strings.Contains(text, line) {
+			t.Errorf("Prometheus output missing %q:\n%s", line, text)
+		}
+	}
+}
+
+func TestConcurrentPrometheusUpdatesAndBackendSwaps(t *testing.T) {
+	first, err := backend.New("http://127.0.0.1:8081", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := backend.New("http://127.0.0.1:8082", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector := metrics.New([]*backend.Backend{first, second})
+	const workers = 8
+	const updates = 100
+	var group sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		group.Add(1)
+		go func(worker int) {
+			defer group.Done()
+			for i := 0; i < updates; i++ {
+				target := first
+				if (worker+i)%2 == 0 {
+					target = second
+				}
+				collector.RecordRequest(target, http.StatusOK, time.Millisecond)
+				if i%10 == 0 {
+					collector.RecordRateLimited()
+				}
+				if i%5 == 0 {
+					collector.SetBackends([]*backend.Backend{first, second})
+				}
+			}
+		}(worker)
+	}
+	group.Wait()
+	text := collector.PrometheusText()
+	if !strings.Contains(text, fmt.Sprintf("loadbear_requests_total %d", workers*updates)) ||
+		!strings.Contains(text, fmt.Sprintf("loadbear_rate_limited_total %d", workers*((updates+9)/10))) {
+		t.Fatalf("concurrent metrics totals incorrect:\n%s", text)
 	}
 }
 

@@ -100,8 +100,8 @@ func TestReloadAddsRemovesAndPreservesUnchangedBackendState(t *testing.T) {
 	}
 	metricText := handler.MetricsText()
 	if len(handler.Status()) != 2 ||
-		!strings.Contains(metricText, `name="`+strings.TrimPrefix(servers[2].URL, "http://")+`"`) ||
-		strings.Contains(metricText, `name="`+strings.TrimPrefix(servers[1].URL, "http://")+`"`) {
+		!strings.Contains(metricText, `backend="`+servers[2].URL+`"`) ||
+		strings.Contains(metricText, `backend="`+servers[1].URL+`"`) {
 		t.Fatal("status and metrics did not reflect the reloaded backend set")
 	}
 

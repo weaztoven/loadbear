@@ -24,6 +24,8 @@ import (
 	"github.com/weaztoven/loadbear/internal/ratelimit"
 )
 
+var errResponseRetryHandled = errors.New("configured failure response retry handled")
+
 type Handler struct {
 	mu          sync.RWMutex
 	config      *config.Config
@@ -33,6 +35,12 @@ type Handler struct {
 	transport   *http.Transport
 	metrics     *metrics.Metrics
 	rateLimiter *ratelimit.RateLimiter
+
+	tunnelMu        sync.Mutex
+	tunnels         map[net.Conn]struct{}
+	tunnelClosing   bool
+	tunnelChanged   chan struct{}
+	pendingUpgrades int
 }
 
 func NewHandler(cfg *config.Config, logger *slog.Logger, strategy balancer.Strategy, backends []*backend.Backend, metricsCollector *metrics.Metrics) *Handler {
@@ -50,13 +58,15 @@ func NewHandler(cfg *config.Config, logger *slog.Logger, strategy balancer.Strat
 		ForceAttemptHTTP2:     true,
 	}
 	handler := &Handler{
-		config:      cfg,
-		logger:      logger,
-		backends:    backends,
-		strategy:    strategy,
-		transport:   transport,
-		metrics:     metricsCollector,
-		rateLimiter: ratelimit.New(cfg.RateLimit.Rate, cfg.RateLimit.Burst, cfg.RateLimit.Window.Duration()),
+		config:        cfg,
+		logger:        logger,
+		backends:      backends,
+		strategy:      strategy,
+		transport:     transport,
+		metrics:       metricsCollector,
+		rateLimiter:   ratelimit.New(cfg.RateLimit.Rate, cfg.RateLimit.Burst, cfg.RateLimit.Window.Duration()),
+		tunnels:       make(map[net.Conn]struct{}),
+		tunnelChanged: make(chan struct{}, 1),
 	}
 	if cfg.RateLimit.Enabled {
 		evictionInterval := cfg.RateLimit.Window.Duration() / 2
@@ -72,6 +82,98 @@ func NewHandler(cfg *config.Config, logger *slog.Logger, strategy balancer.Strat
 
 func (h *Handler) StopBackground() {
 	h.rateLimiter.Stop()
+}
+
+func (h *Handler) BeginShutdown() {
+	h.tunnelMu.Lock()
+	h.tunnelClosing = true
+	h.signalTunnelChangeLocked()
+	h.tunnelMu.Unlock()
+}
+
+func (h *Handler) Shutdown(ctx context.Context) int {
+	h.BeginShutdown()
+	for {
+		h.tunnelMu.Lock()
+		if len(h.tunnels) == 0 && h.pendingUpgrades == 0 {
+			h.tunnelMu.Unlock()
+			return 0
+		}
+		changed := h.tunnelChanged
+		h.tunnelMu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return h.forceCloseTunnels()
+		}
+	}
+}
+
+func (h *Handler) trackTunnel(conn net.Conn) bool {
+	h.tunnelMu.Lock()
+	if h.tunnelClosing {
+		h.tunnelMu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	h.tunnels[conn] = struct{}{}
+	h.signalTunnelChangeLocked()
+	h.tunnelMu.Unlock()
+	return true
+}
+
+func (h *Handler) untrackTunnel(conn net.Conn) {
+	h.tunnelMu.Lock()
+	delete(h.tunnels, conn)
+	h.signalTunnelChangeLocked()
+	h.tunnelMu.Unlock()
+}
+
+func (h *Handler) beginUpgradeRequest() {
+	h.tunnelMu.Lock()
+	h.pendingUpgrades++
+	h.signalTunnelChangeLocked()
+	h.tunnelMu.Unlock()
+}
+
+func (h *Handler) finishUpgradeRequest() {
+	h.tunnelMu.Lock()
+	h.pendingUpgrades--
+	h.signalTunnelChangeLocked()
+	h.tunnelMu.Unlock()
+}
+
+func (h *Handler) signalTunnelChangeLocked() {
+	select {
+	case h.tunnelChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (h *Handler) forceCloseTunnels() int {
+	h.tunnelMu.Lock()
+	connections := make([]net.Conn, 0, len(h.tunnels))
+	for conn := range h.tunnels {
+		connections = append(connections, conn)
+	}
+	h.tunnelMu.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+	if len(connections) > 0 && h.logger != nil {
+		h.logger.Info("forced closed upgraded tunnels during shutdown", "count", len(connections))
+	}
+	for {
+		h.tunnelMu.Lock()
+		if len(h.tunnels) == 0 && h.pendingUpgrades == 0 {
+			h.tunnelMu.Unlock()
+			return len(connections)
+		}
+		changed := h.tunnelChanged
+		h.tunnelMu.Unlock()
+		<-changed
+	}
 }
 
 func (h *Handler) SetBackends(backends []*backend.Backend) {
@@ -109,8 +211,18 @@ func (h *Handler) currentBackends() []*backend.Backend {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	response := &statusWriter{ResponseWriter: w}
+	upgradeRequest := isUpgradeRequest(r)
+	if upgradeRequest {
+		h.beginUpgradeRequest()
+		defer h.finishUpgradeRequest()
+	}
+	response := &statusWriter{ResponseWriter: w, trackTunnel: h.trackTunnel}
 	w = response
+	defer func() {
+		if conn := response.hijackedConn; conn != nil {
+			h.untrackTunnel(conn)
+		}
+	}()
 	requestID := requestIDFromHeader(r)
 	if requestID == "" {
 		requestID = newRequestID()
@@ -141,6 +253,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.config.RateLimit.Enabled {
 		allowed, retryAfter := h.rateLimiter.Allow(clientIP)
 		if !allowed {
+			if h.metrics != nil {
+				h.metrics.RecordRateLimited()
+			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -176,6 +291,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	serveAttempt = func(current *backend.Backend, attempt int, attemptRequest *http.Request, isProbe bool) {
 		selected = current
 		current.IncrementActive()
+		current.RecordRequest()
 		probeResolved := false
 		defer func() {
 			if isProbe && !probeResolved {
@@ -200,6 +316,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 		reverseProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			if errors.Is(err, errResponseRetryHandled) {
+				return
+			}
 			current.SetHealthy(false)
 			current.RecordFailure()
 			probeResolved = true
@@ -238,17 +357,57 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				statusCode = http.StatusGatewayTimeout
 			}
 			if h.metrics != nil {
-				h.metrics.RecordRequest(current, statusCode, time.Since(start))
+				h.metrics.RecordObservation(statusCode, time.Since(start), true)
 			}
 			h.writePlainText(w, statusCode, http.StatusText(statusCode))
 		}
 		reverseProxy.ModifyResponse = func(resp *http.Response) error {
 			resp.Header.Set("X-Request-ID", requestID)
-			current.RecordSuccess()
 			probeResolved = true
 			current.SetHealthy(true)
-			if h.metrics != nil {
-				h.metrics.RecordRequest(current, resp.StatusCode, time.Since(start))
+			configuredFailure := h.isCircuitFailureStatus(resp.StatusCode)
+			failureStatus := resp.StatusCode >= http.StatusInternalServerError || configuredFailure
+			if failureStatus {
+				if !configuredFailure {
+					current.RecordSuccess()
+				}
+				if configuredFailure && !isUpgradeRequest(r) && retryableMethod(r.Method) &&
+					requestBodyReplayable(r) && !response.wroteHeader() &&
+					attempt < h.config.Proxy.RetryMaxAttempts {
+					next, nextIsProbe := h.selectBackendExcluding(selectionRequest, current)
+					if next != nil {
+						retryProbeTransferred := false
+						if nextIsProbe {
+							defer func() {
+								if !retryProbeTransferred {
+									next.AbortHalfOpenProbe()
+								}
+							}()
+						}
+						retryRequest, replayErr := cloneReplayableRequest(r)
+						if replayErr == nil {
+							replayErr = waitForRetry(r.Context(), h.config.Proxy.RetryBackoff.Duration())
+						}
+						if replayErr == nil {
+							replayErr = r.Context().Err()
+						}
+						if replayErr == nil {
+							current.RecordFailure()
+							retryProbeTransferred = true
+							serveAttempt(next, attempt+1, retryRequest, nextIsProbe)
+							return errResponseRetryHandled
+						}
+					}
+				}
+				current.RecordFailure()
+				if h.metrics != nil {
+					h.metrics.RecordObservation(resp.StatusCode, time.Since(start), true)
+				}
+			} else {
+				current.RecordSuccess()
+				if h.metrics != nil {
+					h.metrics.RecordObservation(resp.StatusCode, time.Since(start), false)
+				}
 			}
 			return nil
 		}
@@ -268,9 +427,35 @@ func (h *Handler) selectBackend(req *http.Request) (*backend.Backend, bool) {
 	return strategy.Select(backends, req), false
 }
 
+func (h *Handler) selectBackendExcluding(req *http.Request, excluded *backend.Backend) (*backend.Backend, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	backends := make([]*backend.Backend, 0, len(h.backends))
+	for _, candidate := range h.backends {
+		if candidate != nil && candidate != excluded {
+			backends = append(backends, candidate)
+		}
+	}
+	if strategy, ok := h.strategy.(balancer.ProbeStrategy); ok {
+		return strategy.SelectWithProbe(backends, req)
+	}
+	return h.strategy.Select(backends, req), false
+}
+
+func (h *Handler) isCircuitFailureStatus(status int) bool {
+	for _, configured := range h.config.Proxy.CircuitFailureStatuses {
+		if configured == status {
+			return true
+		}
+	}
+	return false
+}
+
 type statusWriter struct {
 	http.ResponseWriter
-	status int
+	status       int
+	trackTunnel  func(net.Conn) bool
+	hijackedConn net.Conn
 }
 
 func (w *statusWriter) WriteHeader(status int) {
@@ -297,7 +482,14 @@ func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if !ok {
 		return nil, nil, errors.New("underlying response writer does not support hijacking")
 	}
-	return hijacker.Hijack()
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	if w.trackTunnel == nil || w.trackTunnel(conn) {
+		w.hijackedConn = conn
+	}
+	return conn, rw, nil
 }
 
 func (w *statusWriter) Flush() {

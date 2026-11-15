@@ -118,7 +118,7 @@ func main() {
 		select {
 		case <-shutdownCtx.Done():
 			logger.Info("shutdown initiated")
-			shutdownServer(proxyServer, adminServer, cfg.Shutdown.GracePeriod.Duration())
+			shutdownServer(proxyServer, adminServer, handler, cfg.Shutdown.GracePeriod.Duration())
 			logger.Info("goodbye")
 			healthChecker.Stop()
 			handler.StopBackground()
@@ -141,11 +141,21 @@ func drainReloadSignals(signals <-chan os.Signal) {
 	}
 }
 
-func shutdownServer(proxyServer *http.Server, adminServer *http.Server, grace time.Duration) {
+func shutdownServer(proxyServer *http.Server, adminServer *http.Server, handler *proxy.Handler, grace time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
+	if handler != nil {
+		handler.BeginShutdown()
+	}
 	_ = proxyServer.Shutdown(ctx)
 	_ = adminServer.Shutdown(ctx)
+	if ctx.Err() != nil {
+		_ = proxyServer.Close()
+		_ = adminServer.Close()
+	}
+	if handler != nil {
+		handler.Shutdown(ctx)
+	}
 }
 
 func recoverMiddleware(next http.Handler) http.Handler {
