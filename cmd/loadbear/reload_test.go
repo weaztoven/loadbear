@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,11 +55,17 @@ func newReloadTestManager(t *testing.T, cfg *config.Config, logger *slog.Logger)
 	handler := proxy.NewHandler(cfg, logger, strategy, backends, collector)
 	checker := health.New(backends, cfg.Health.Path, cfg.Health.Interval.Duration(), cfg.Health.Timeout.Duration(),
 		cfg.Health.HealthyThreshold, cfg.Health.UnhealthyThreshold, logger)
+	manager := newReloadManager("", cfg, handler, checker, logger)
 	t.Cleanup(func() {
-		checker.Stop()
+		manager.mu.Lock()
+		currentChecker := manager.healthChecker
+		manager.mu.Unlock()
+		if currentChecker != nil {
+			currentChecker.Stop()
+		}
 		handler.StopBackground()
 	})
-	return newReloadManager("", cfg, handler, checker, logger), handler, checker
+	return manager, handler, checker
 }
 
 func TestReloadAddsRemovesAndPreservesUnchangedBackendState(t *testing.T) {
@@ -249,7 +256,9 @@ func TestHealthCheckerTracksReloadedBackendsAndStops(t *testing.T) {
 	waitReloadCondition(t, time.Second, func() bool {
 		return hits[0].Load() > 0 && hits[1].Load() > 0
 	})
-	if err := manager.Reload(reloadTestConfig("round_robin", servers[0], servers[2])); err != nil {
+	updated := reloadTestConfig("round_robin", servers[0], servers[2])
+	updated.Health = initial.Health
+	if err := manager.Reload(updated); err != nil {
 		t.Fatal(err)
 	}
 	waitReloadCondition(t, time.Second, func() bool { return hits[2].Load() > 0 })
@@ -260,6 +269,259 @@ func TestHealthCheckerTracksReloadedBackendsAndStops(t *testing.T) {
 		t.Fatalf("health checker continued probing removed backend: %d -> %d", removedHits, got)
 	}
 	checker.Stop()
+}
+
+func TestReloadHealthIntervalTakesEffect(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	initial := reloadTestConfig("round_robin", server)
+	initial.Health.Interval = config.YAMLDuration(time.Hour)
+	manager, _, oldChecker := newReloadTestManager(t, initial, nil)
+	oldChecker.Start()
+
+	updated := reloadTestConfig("round_robin", server)
+	updated.Health = initial.Health
+	updated.Health.Interval = config.YAMLDuration(5 * time.Millisecond)
+	if err := manager.Reload(updated); err != nil {
+		t.Fatal(err)
+	}
+	if manager.healthChecker == oldChecker {
+		t.Fatal("health interval change kept the old checker")
+	}
+	waitReloadCondition(t, time.Second, func() bool { return hits.Load() > 0 })
+	if manager.healthChecker.Interval != 5*time.Millisecond {
+		t.Fatalf("reloaded interval = %s, want 5ms", manager.healthChecker.Interval)
+	}
+}
+
+func TestReloadHealthPathAndThresholdsTakeEffect(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusServiceUnavailable)
+	var oldPathHits atomic.Int32
+	var readyPathHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/old" {
+			oldPathHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/ready" {
+			readyPathHits.Add(1)
+			w.WriteHeader(int(status.Load()))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	initial := reloadTestConfig("round_robin", server)
+	initial.Health.Path = "/old"
+	initial.Health.Interval = config.YAMLDuration(time.Hour)
+	initial.Health.HealthyThreshold = 2
+	initial.Health.UnhealthyThreshold = 2
+	manager, handler, oldChecker := newReloadTestManager(t, initial, nil)
+	oldChecker.Start()
+	b := handler.CurrentBackends()[0]
+
+	updated := reloadTestConfig("round_robin", server)
+	updated.Health = initial.Health
+	updated.Health.Path = "/ready"
+	updated.Health.Interval = config.YAMLDuration(5 * time.Millisecond)
+	updated.Health.HealthyThreshold = 1
+	updated.Health.UnhealthyThreshold = 1
+	if err := manager.Reload(updated); err != nil {
+		t.Fatal(err)
+	}
+	waitReloadCondition(t, time.Second, func() bool {
+		return readyPathHits.Load() > 0 && !b.IsHealthy()
+	})
+	status.Store(http.StatusOK)
+	waitReloadCondition(t, time.Second, b.IsHealthy)
+	if oldPathHits.Load() != 0 {
+		t.Fatalf("old health path was checked %d times after reload", oldPathHits.Load())
+	}
+}
+
+func TestInvalidHealthReloadKeepsOldCheckerRunning(t *testing.T) {
+	var oldPathHits atomic.Int32
+	var newPathHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/old":
+			oldPathHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/new":
+			newPathHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	initial := reloadTestConfig("round_robin", server)
+	initial.Health.Path = "/old"
+	initial.Health.Interval = config.YAMLDuration(5 * time.Millisecond)
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	manager, _, oldChecker := newReloadTestManager(t, initial, logger)
+	oldChecker.Start()
+	waitReloadCondition(t, time.Second, func() bool { return oldPathHits.Load() > 0 })
+	oldHits := oldPathHits.Load()
+
+	invalid := reloadTestConfig("round_robin", server)
+	invalid.Health = initial.Health
+	invalid.Health.Path = "/new"
+	invalid.Health.Timeout = 0
+	if err := manager.Reload(invalid); err == nil || !strings.Contains(err.Error(), "health.timeout") {
+		t.Fatalf("invalid health reload error = %v; want health.timeout validation error", err)
+	}
+	if manager.healthChecker != oldChecker || oldChecker.Path != "/old" {
+		t.Fatal("invalid health reload replaced or modified the running checker")
+	}
+	waitReloadCondition(t, time.Second, func() bool { return oldPathHits.Load() > oldHits })
+	if newPathHits.Load() != 0 || !strings.Contains(output.String(), "health.timeout") {
+		t.Fatalf("invalid reload changed path or omitted field error: new-path hits=%d logs=%q",
+			newPathHits.Load(), output.String())
+	}
+}
+
+func TestHealthReloadCancelsInflightCheckWithoutChangingBackendHealth(t *testing.T) {
+	started := make(chan struct{}, 1)
+	var inFlight atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/old" {
+			inFlight.Add(1)
+			defer inFlight.Add(-1)
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-r.Context().Done()
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	initial := reloadTestConfig("round_robin", server)
+	initial.Health.Path = "/old"
+	initial.Health.Interval = config.YAMLDuration(2 * time.Millisecond)
+	initial.Health.Timeout = config.YAMLDuration(time.Second)
+	initial.Health.UnhealthyThreshold = 1
+	manager, handler, checker := newReloadTestManager(t, initial, nil)
+	checker.Start()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("old checker did not start an in-flight health check")
+	}
+
+	updated := reloadTestConfig("round_robin", server)
+	updated.Health = initial.Health
+	updated.Health.Path = "/new"
+	updated.Health.Interval = config.YAMLDuration(time.Hour)
+	if err := manager.Reload(updated); err != nil {
+		t.Fatal(err)
+	}
+	if got := inFlight.Load(); got != 0 {
+		t.Fatalf("in-flight old health check remained active after reload: %d", got)
+	}
+	if !handler.CurrentBackends()[0].IsHealthy() {
+		t.Fatal("cancelled health check marked the unchanged backend unhealthy")
+	}
+}
+
+func TestRepeatedHealthReloadsStopOldCheckers(t *testing.T) {
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	started := make(chan struct{}, 20)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		for current > maxActive.Load() && !maxActive.CompareAndSwap(maxActive.Load(), current) {
+		}
+		defer active.Add(-1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	initial := reloadTestConfig("round_robin", server)
+	initial.Health.Interval = config.YAMLDuration(2 * time.Millisecond)
+	initial.Health.Timeout = config.YAMLDuration(time.Second)
+	manager, _, checker := newReloadTestManager(t, initial, nil)
+	checker.Start()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("initial health loop did not start")
+	}
+
+	for _, interval := range []time.Duration{4, 6, 8} {
+		oldChecker := manager.healthChecker
+		updated := reloadTestConfig("round_robin", server)
+		updated.Health = initial.Health
+		updated.Health.Interval = config.YAMLDuration(interval * time.Millisecond)
+		if err := manager.Reload(updated); err != nil {
+			t.Fatal(err)
+		}
+		if manager.healthChecker == oldChecker {
+			t.Fatal("health settings reload reused the stopped checker")
+		}
+		oldChecker.Stop()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("replacement health loop did not start")
+		}
+	}
+	if got := maxActive.Load(); got > 1 {
+		t.Fatalf("overlapping health checks across reloads = %d, want at most 1", got)
+	}
+}
+
+func TestConcurrentHealthSettingsReloadsAreSafe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	initial := reloadTestConfig("round_robin", server)
+	initial.Health.Interval = config.YAMLDuration(time.Hour)
+	manager, _, checker := newReloadTestManager(t, initial, nil)
+	checker.Start()
+
+	const workers = 8
+	var group sync.WaitGroup
+	errs := make(chan error, workers)
+	for worker := 0; worker < workers; worker++ {
+		worker := worker
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for i := 0; i < 5; i++ {
+				updated := reloadTestConfig("round_robin", server)
+				updated.Health.Path = fmt.Sprintf("/health/%d/%d", worker, i)
+				updated.Health.Interval = config.YAMLDuration(time.Duration(worker+i+1) * time.Millisecond)
+				if err := manager.Reload(updated); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent health reload failed: %v", err)
+	}
+	if strings.HasPrefix(manager.healthChecker.Path, "/health/") == false ||
+		manager.healthChecker.Interval <= 0 {
+		t.Fatalf("final checker does not use a reloaded config: path=%q interval=%s",
+			manager.healthChecker.Path, manager.healthChecker.Interval)
+	}
 }
 
 func waitReloadCondition(t *testing.T, timeout time.Duration, condition func() bool) {

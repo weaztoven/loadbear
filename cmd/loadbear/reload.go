@@ -63,6 +63,11 @@ func (m *reloadManager) Reload(updated *config.Config) error {
 		m.logger.Error("configuration reload rejected", "error", err)
 		return err
 	}
+	healthConfig := updated.Health
+	if healthConfig.Path == "" {
+		healthConfig.Path = config.DefaultHealthPath
+	}
+	healthSettingsChanged := !sameHealthSettings(m.healthChecker, healthConfig)
 
 	existing := make(map[string]*backend.Backend)
 	for _, current := range m.handler.CurrentBackends() {
@@ -93,10 +98,37 @@ func (m *reloadManager) Reload(updated *config.Config) error {
 	added := len(newBackends) - unchanged
 	removed := len(existing)
 
+	if healthSettingsChanged && m.healthChecker != nil {
+		m.healthChecker.Stop()
+	}
 	m.handler.ReplaceBackendSet(newBackends, strategy, weightUpdates)
-	if m.healthChecker != nil {
+	if healthSettingsChanged {
+		m.healthChecker = health.New(newBackends, healthConfig.Path, healthConfig.Interval.Duration(),
+			healthConfig.Timeout.Duration(), healthConfig.HealthyThreshold, healthConfig.UnhealthyThreshold, m.logger)
+		m.healthChecker.Start()
+	} else if m.healthChecker != nil {
 		m.healthChecker.SetBackends(newBackends)
 	}
 	m.logger.Info("backend list reloaded", "added", added, "removed", removed, "unchanged", unchanged, "strategy", updated.Strategy)
 	return nil
+}
+
+func sameHealthSettings(checker *health.Checker, updated config.HealthConfig) bool {
+	if checker == nil {
+		return false
+	}
+	return checker.Path == updated.Path &&
+		checker.Interval == updated.Interval.Duration() &&
+		checker.Timeout == updated.Timeout.Duration() &&
+		checker.HealthyThreshold == updated.HealthyThreshold &&
+		checker.UnhealthyThreshold == updated.UnhealthyThreshold
+}
+
+func (m *reloadManager) StopHealthChecker() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.healthChecker != nil {
+		m.healthChecker.Stop()
+		m.healthChecker = nil
+	}
 }
