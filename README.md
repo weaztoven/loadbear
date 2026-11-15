@@ -122,9 +122,10 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 | `proxy.request_timeout` | duration | `30s` | HTTP server read and write timeout setting; a client request context/deadline also bounds all upstream attempts and backoff. |
 | `proxy.retry_max_attempts` | integer | `2` | Maximum total attempts for eligible requests, including the first selection. Retried requests must have no body or a `GetBody` replay function. |
 | `proxy.retry_backoff` | duration | `100ms` | Delay between retry attempts; waiting stops when the request context is cancelled. |
-| `proxy.circuit_failure_threshold` | integer | `5` | Consecutive transport failures, upstream 5xx responses, or configured failure statuses before opening a backend circuit. |
+| `proxy.circuit_failure_threshold` | integer | `5` | Consecutive transport failures or response failures before opening a backend circuit; opt-in tunnel errors use their own consecutive-error streak. |
 | `proxy.circuit_cooldown` | duration | `30s` | Time an open circuit waits before allowing one half-open probe. |
-| `proxy.circuit_failure_statuses` | list of integers | `[]` | Additional HTTP response statuses counted as circuit failures. Explicitly configured statuses can be retried for eligible GET/HEAD/OPTIONS requests with replayable bodies when another backend is available and no response has been committed. With the empty default, upstream 5xx responses count toward the consecutive-failure threshold but do not trigger status-based retries; 429 and 404 do not count unless listed. Startup-only. |
+| `proxy.circuit_failure_statuses` | list of integers | `[]` | Adds statuses to the default rule that every upstream 5xx counts as a breaker failure; it does not replace that rule. Listed statuses may be retried only for eligible GET/HEAD/OPTIONS requests with an absent or replayable body when another backend is available and no response is committed. A 5xx always counts, even when this list is empty; 429 and 404 do not count unless listed. Response statuses do not mark a backend unhealthy. Startup-only. |
+| `proxy.circuit_count_tunnel_errors` | boolean | `false` | Opt in to breaker failures for upstream tunnel I/O errors only. Clean upstream closes, client closes, shutdown-forced closes, and unknown outcomes never count. Does not retry or mark a backend unhealthy; the 101 handshake remains a success. Startup-only. |
 | `rate_limit.enabled` | boolean | `true` | Enable per-client-IP request limiting. |
 | `rate_limit.rate` | number | `100` | Token refill rate per second. |
 | `rate_limit.burst` | integer | `200` | Maximum token bucket size. |
@@ -134,7 +135,7 @@ Durations accept Go duration strings such as `"10s"` or integer seconds. Default
 
 See [examples/config.example.yaml](examples/config.example.yaml) and [examples/config.docker.yaml](examples/config.docker.yaml).
 
-An upstream 500, 502, or 503 contributes to the consecutive breaker-failure threshold and can open the circuit, but the HTTP response alone does not mark the backend unhealthy or trigger a retry. Transport errors mark the backend unhealthy and may be retried under the existing retry rules.
+With the default empty `proxy.circuit_failure_statuses`, upstream 500, 502, and 503 responses contribute to the breaker-failure threshold but do not mark the backend unhealthy or trigger status-based retries. Listing a status opts that response into the retry rules described above. Transport errors mark the backend unhealthy and may be retried under the existing retry rules.
 
 ## Reloading configuration
 
@@ -194,11 +195,11 @@ The `/status` endpoint exposes backend URLs and topology. Keep the admin listene
 }
 ```
 
-`GET /metrics` returns Prometheus text with cumulative latency buckets, `_sum`/`_count`, per-backend request/failure counters, backend health/active-connection/circuit gauges, and a rate-limited counter. Per-backend request and failure counters include upstream attempts; global request and latency series describe the final proxied request result, while rate-limited requests have their own counter. Backend label values are escaped, and backend series are sorted for stable output.
+`GET /metrics` returns Prometheus text with cumulative request- and tunnel-duration buckets, `_sum`/`_count`, per-backend request/failure counters, active connection/tunnel and circuit-state gauges, a rate-limited counter, and per-backend tunnel-close counters. Per-backend request and failure counters include upstream attempts; global request and latency series describe the final proxied request result, while rate-limited requests have their own counter. Emitted tunnel close reasons are `client_closed`, `upstream_closed`, `upstream_error`, `shutdown_forced`, and `unknown`. `shutdown_forced` is explicit; `client_closed`, `upstream_closed`, and `upstream_error` are best-effort classifications based on observed TCP EOFs or upstream I/O errors. Client-side I/O errors and ambiguous outcomes are `unknown`. Backend label values are escaped, and backend series are sorted for stable output.
 
 Go profiling is disabled by default. Set `admin.pprof_enabled: true` to enable `GET /debug/pprof/` and its standard profile handlers on the admin listener. These endpoints can expose runtime and application details and consume resources while collecting profiles; never expose the admin listener or pprof endpoints publicly.
 
-This example was generated by running the metrics implementation with three observations (8 ms, 20 s, and 5 ms), two attributed to the backend:
+This example is generated by `TestPrometheusHistogramIsCumulativeAndIncludesSumAndCount` with three request observations (8 ms, 20 s, and 5 ms), two attributed to the backend, plus one 75-second upstream-error tunnel:
 
 ```text
 # HELP loadbear_requests_total Total number of proxied requests.
@@ -243,6 +244,31 @@ loadbear_backend_active_connections{backend="http://127.0.0.1:8081"} 1
 # HELP loadbear_circuit_state Backend circuit state (0 closed, 1 open, 2 half-open).
 # TYPE loadbear_circuit_state gauge
 loadbear_circuit_state{backend="http://127.0.0.1:8081"} 0
+# HELP loadbear_active_tunnels Total number of active upgraded tunnels.
+# TYPE loadbear_active_tunnels gauge
+loadbear_active_tunnels 0
+# HELP loadbear_backend_active_tunnels Active upgraded tunnels per backend.
+# TYPE loadbear_backend_active_tunnels gauge
+loadbear_backend_active_tunnels{backend="http://127.0.0.1:8081"} 0
+# HELP loadbear_tunnel_duration_seconds Duration of completed upgraded tunnels in seconds.
+# TYPE loadbear_tunnel_duration_seconds histogram
+loadbear_tunnel_duration_seconds_bucket{le="1"} 0
+loadbear_tunnel_duration_seconds_bucket{le="5"} 0
+loadbear_tunnel_duration_seconds_bucket{le="15"} 0
+loadbear_tunnel_duration_seconds_bucket{le="60"} 0
+loadbear_tunnel_duration_seconds_bucket{le="300"} 1
+loadbear_tunnel_duration_seconds_bucket{le="900"} 1
+loadbear_tunnel_duration_seconds_bucket{le="3600"} 1
+loadbear_tunnel_duration_seconds_bucket{le="+Inf"} 1
+loadbear_tunnel_duration_seconds_sum 75
+loadbear_tunnel_duration_seconds_count 1
+# HELP loadbear_tunnel_closed_total Total number of closed upgraded tunnels by backend and reason.
+# TYPE loadbear_tunnel_closed_total counter
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="client_closed"} 0
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="upstream_closed"} 0
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="upstream_error"} 1
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="shutdown_forced"} 0
+loadbear_tunnel_closed_total{backend="http://127.0.0.1:8081",reason="unknown"} 0
 ```
 
 For example, query them at `http://localhost:9090/status` and `http://localhost:9090/metrics`.
@@ -349,13 +375,17 @@ Rounded, and only as an indication for this machine: a direct connection reached
 
 The two-run results do not establish a reliable strategy ranking; no strategy is claimed to be faster from this sample.
 
+## WebSocket and the circuit breaker
+
+A clean upstream TCP close cannot distinguish a normal client-initiated WebSocket close handshake from a backend dropping the tunnel. Therefore, `proxy.circuit_count_tunnel_errors` counts only observed upstream I/O errors, such as a connection reset or broken pipe; clean `upstream_closed` events are never breaker failures. The option defaults to `false`. When enabled, each observed upstream I/O error counts once toward a separate consecutive-error streak; it does not retry the request or mark the backend unhealthy, and a 101 handshake remains a success.
+
 ## Known limitations and roadmap
 
 - WebSocket-style upgrades are verified only for an HTTP/1.1 upgrade handshake and bidirectional raw-byte echo through the proxy; this does not verify full RFC 6455 protocol behavior.
 - SIGHUP configuration reload is unavailable on Windows.
 - Metrics are a small hand-written Prometheus text endpoint, not a complete Prometheus client implementation.
 - The benchmark exercises local fake backends and does not represent production workloads.
-- Failures after a WebSocket upgrade handshake are not fed to the circuit breaker; a 101 response is recorded as a success.
+- Tunnel close reasons describe observed transport events, not WebSocket protocol intent; in particular, clean close events cannot identify which side initiated a WebSocket close handshake.
 
 ## Security notes
 

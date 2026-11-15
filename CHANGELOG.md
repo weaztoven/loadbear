@@ -5,6 +5,13 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Tunnel active gauges, duration histogram, and per-backend close-reason counters; ambiguous close causes are reported as `unknown`.
+- Opt-in `proxy.circuit_count_tunnel_errors` breaker accounting for upstream tunnel I/O errors only. Clean upstream closes are never counted because a normal WebSocket close handshake is indistinguishable at the TCP level; the feature defaults off.
+
 ## [0.3.0] - 2026-11-15
 
 ### Changed

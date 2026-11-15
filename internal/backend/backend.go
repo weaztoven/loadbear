@@ -35,6 +35,7 @@ type Backend struct {
 	CircuitOpenedAt         time.Time
 	circuitMux              sync.Mutex
 	consecutiveFailures     int32
+	consecutiveTunnelDrops  int32
 	halfOpenProbeInFlight   bool
 }
 
@@ -117,7 +118,20 @@ func (b *Backend) RecordFailure() {
 func (b *Backend) RecordSuccess() {
 	b.circuitMux.Lock()
 	defer b.circuitMux.Unlock()
+	b.recordSuccessLocked(true)
+}
+
+func (b *Backend) RecordHandshakeSuccess() {
+	b.circuitMux.Lock()
+	defer b.circuitMux.Unlock()
+	b.recordSuccessLocked(b.CircuitState == CircuitHalfOpen)
+}
+
+func (b *Backend) recordSuccessLocked(resetTunnelDrops bool) {
 	b.consecutiveFailures = 0
+	if resetTunnelDrops {
+		b.consecutiveTunnelDrops = 0
+	}
 	if b.CircuitState == CircuitOpen {
 		if time.Since(b.CircuitOpenedAt) >= b.CircuitCooldown {
 			b.CircuitState = CircuitClosed
@@ -128,6 +142,30 @@ func (b *Backend) RecordSuccess() {
 		b.CircuitState = CircuitClosed
 		b.halfOpenProbeInFlight = false
 	}
+}
+
+func (b *Backend) RecordTunnelFailure() {
+	b.TotalFailures.Add(1)
+	b.circuitMux.Lock()
+	defer b.circuitMux.Unlock()
+	b.consecutiveTunnelDrops++
+	if b.CircuitState == CircuitHalfOpen {
+		b.CircuitState = CircuitOpen
+		b.CircuitOpenedAt = time.Now()
+		b.halfOpenProbeInFlight = false
+		return
+	}
+	if b.CircuitState == CircuitClosed && int(b.consecutiveTunnelDrops) >= b.CircuitFailureThreshold {
+		b.CircuitState = CircuitOpen
+		b.CircuitOpenedAt = time.Now()
+		b.halfOpenProbeInFlight = false
+	}
+}
+
+func (b *Backend) RecordTunnelSuccess() {
+	b.circuitMux.Lock()
+	b.consecutiveTunnelDrops = 0
+	b.circuitMux.Unlock()
 }
 
 func (b *Backend) AllowRequest() bool {
