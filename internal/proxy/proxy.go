@@ -49,14 +49,14 @@ type reverseProxyBufferPool struct {
 }
 
 func (p *reverseProxyBufferPool) Get() []byte {
-	if buffer := p.pool.Get(); buffer != nil {
-		return buffer.([]byte)
+	if v := p.pool.Get(); v != nil {
+		return *(v.(*[]byte))
 	}
 	return make([]byte, 32*1024)
 }
 
 func (p *reverseProxyBufferPool) Put(buffer []byte) {
-	p.pool.Put(buffer)
+	p.pool.Put(&buffer)
 }
 
 func NewHandler(cfg *config.Config, logger *slog.Logger, strategy balancer.Strategy, backends []*backend.Backend, metricsCollector *metrics.Metrics) *Handler {
@@ -319,7 +319,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reverseProxy := &httputil.ReverseProxy{
 			Transport:  h.transport,
 			BufferPool: h.bufferPool,
-			Rewrite:    func(req *httputil.ProxyRequest) {
+			Rewrite: func(req *httputil.ProxyRequest) {
 				req.SetURL(current.URL)
 				req.Out.Host = current.URL.Host
 				stripHopByHopHeaders(req.Out.Header)
